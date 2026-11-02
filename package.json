@@ -1,0 +1,20 @@
+{
+  "name": "serendib-latex-suite",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "concurrently -n api,web -c green,cyan \"npm run dev -w @latex/api\" \"npm run dev -w @latex/web\"",
+    "build": "npm run build -w @latex/domain && npm run build -w @latex/api && npm run build -w @latex/web",
+    "test": "npm run build -w @latex/domain && npm run test -w @latex/domain && npm run test -w @latex/api && npm run test -w @latex/web",
+    "lint": "npm run lint -ws --if-present",
+    "typecheck": "npm run build -w @latex/domain && npm run typecheck -w @latex/api && npm run typecheck -w @latex/web",
+    "seed": "npm run seed -w @latex/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "npm@11.6.2",
+  "engines": { "node": "24.x" }
+}

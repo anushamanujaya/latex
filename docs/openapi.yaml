@@ -1,0 +1,47 @@
+openapi: 3.1.0
+info: { title: Araliya Latex API, version: 1.0.0 }
+servers: [{ url: /api/v1 }]
+components:
+  securitySchemes:
+    sessionCookie: { type: apiKey, in: cookie, name: access_token }
+  schemas:
+    Error:
+      type: object
+      properties: { error: { type: object, properties: { code: { type: string }, message: { type: string } } } }
+    PurchaseCreate:
+      type: object
+      required: [idempotencyKey, locationId, supplierId, eventAt, litresMilli, densityReading]
+      properties:
+        idempotencyKey: { type: string, format: uuid }
+        locationId: { type: string }
+        supplierId: { type: string }
+        eventAt: { type: string, format: date-time }
+        litresMilli: { type: integer, minimum: 1 }
+        densityReading: { type: integer }
+        cashPaidCents: { type: integer, minimum: 0 }
+        advanceApplications: { type: array, items: { type: object, properties: { advanceId: { type: string }, amountCents: { type: integer, minimum: 1 } } } }
+paths:
+  /auth/login:
+    post:
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [email, password], properties: { email: { type: string, format: email }, password: { type: string } } } } } }
+      responses: { '200': { description: Authenticated }, '401': { description: Invalid credentials } }
+  /purchases:
+    get:
+      security: [{ sessionCookie: [] }]
+      responses: { '200': { description: Paginated purchase register } }
+    post:
+      security: [{ sessionCookie: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PurchaseCreate' } } } }
+      responses: { '201': { description: Purchase created or idempotently returned }, '409': { description: Configuration or transaction conflict }, '422': { description: Validation error } }
+  /dispatches/preview:
+    get:
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: locationId, in: query, required: true, schema: { type: string } }
+        - { name: lastSequence, in: query, required: true, schema: { type: integer } }
+      responses: { '200': { description: Exact inclusive boundary preview }, '409': { description: Gap or overlap } }
+  /dispatches/confirm:
+    post:
+      security: [{ sessionCookie: [] }]
+      responses: { '201': { description: Atomically confirmed dispatch }, '409': { description: Concurrent boundary conflict } }
