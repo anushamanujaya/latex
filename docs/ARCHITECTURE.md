@@ -22,6 +22,10 @@ The suite is split into independently deployable `apps/api` and `apps/web` appli
 
 `CashBankAccount -> CashBankTransaction` links payment events without redefining their accounting nature.
 
+`CashierShift -> CashBankTransaction` defines the immutable opening-to-closing reconciliation boundary for cash movements.
+
+`DispatchBatch -> CompanyInvoice -> CompanySettlement -> BuyerLedgerEntry` separates sale revenue, receivable, and collection.
+
 ## UI screens
 
 Dashboard; keyboard-first Latex POS and receipt; purchase history/detail/reversal; suppliers and statements; advances and payments; rate/density settings; derived inventory; dispatch boundary picker/preview/confirmation; companies and settlements; expenses/cash book; reports/exports; audit; staff/roles; business settings.
@@ -43,6 +47,7 @@ Dashboard; keyboard-first Latex POS and receipt; purchase history/detail/reversa
 - [x] Phase 4: transactional purchase settlement/advance allocation and supplier ledger foundation.
 - [x] Phase 5: pending inventory and sequence-boundary dispatch preview/confirmation foundation.
 - [x] Phase 6: snapshot-based dispatch profit calculation.
+- [x] Phase A financial foundation: allocated supplier payments/reversals, advances/recovery/reversals, cash/bank ledger, cashier reconciliation, and buyer receivables/settlements.
 - [ ] Phase 7: full report catalogue, XLSX/PDF exports, and all analytics screens.
 - [ ] Phase 8: complete E2E matrix, hardened production operations, backup-restore drill, observability, and deployment smoke tests.
 

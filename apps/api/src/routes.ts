@@ -1,13 +1,21 @@
 import { Router } from 'express';
 import argon2 from 'argon2';
 import jwt from 'jsonwebtoken';
-import mongoose from 'mongoose';
 import { z } from 'zod';
 import { config } from './config.js';
 import { allow, AppError, auth } from './http.js';
-import { AuditLog, BuyerCompany, DensityFactorVersion, DispatchBatch, Purchase, PurchaseRate, Supplier, SupplierAdvance, SupplierLedgerEntry, User } from './models.js';
+import {
+  AdvanceAllocation, AdvanceRepayment, AuditLog, BuyerCompany, BuyerLedgerEntry, CashBankTransaction, CashierShift,
+  CompanyInvoice, CompanySettlement, DensityFactorVersion, DispatchBatch, Purchase, PurchaseRate, Supplier,
+  SupplierAdvance, SupplierLedgerEntry, SupplierPayment, User,
+} from './models.js';
 import { createPurchase } from './services/purchase-service.js';
 import { confirmDispatch, previewDispatch } from './services/dispatch-service.js';
+import {
+  closeCashierShift, createCashBankAccount, createCompanyInvoice, issueSupplierAdvance, listCashBankAccountsWithBalances,
+  openCashierShift, postCompanySettlement, postSupplierPayment, recordAdvanceRepayment, reverseAdvanceAllocation,
+  reverseAdvanceRepayment, reverseCompanySettlement, reverseSupplierAdvance, reverseSupplierPayment,
+} from './services/financial-service.js';
 import { connectDatabase } from './db.js';
 
 const asyncRoute = (fn: (req: any, res: any) => Promise<unknown>) => (req: any, res: any, next: any) => Promise.resolve(fn(req, res)).catch(next);
@@ -76,7 +84,10 @@ router.post('/purchases', allow('ADMIN', 'MANAGER', 'CASHIER'), asyncRoute(async
 router.get('/purchases', asyncRoute(async (req, res) => {
   const page = Math.max(1, Number(req.query.page ?? 1));
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 25)));
-  const [data, total] = await Promise.all([Purchase.find().sort({ eventAt: -1, sequence: -1 }).skip((page - 1) * limit).limit(limit).populate('supplierId', 'code name').lean(), Purchase.countDocuments()]);
+  const filter: Record<string, unknown> = { reversedAt: { $exists: false } };
+  if (req.query.supplierId) filter.supplierId = String(req.query.supplierId);
+  if (req.query.outstanding === 'true') filter.outstandingCents = { $gt: 0 };
+  const [data, total] = await Promise.all([Purchase.find(filter).sort({ eventAt: -1, sequence: -1 }).skip((page - 1) * limit).limit(limit).populate('supplierId', 'code name').lean(), Purchase.countDocuments(filter)]);
   res.json({ data, pagination: { page, limit, total, pages: Math.ceil(total / limit) } });
 }));
 router.get('/purchases/:id', asyncRoute(async (req, res) => {
@@ -86,31 +97,89 @@ router.get('/purchases/:id', asyncRoute(async (req, res) => {
 }));
 
 router.get('/advances/available/:supplierId', asyncRoute(async (req, res) => {
-  const data = await SupplierAdvance.find({ supplierId: req.params.supplierId }).lean();
+  const data = await SupplierAdvance.find({ supplierId: req.params.supplierId, status: { $ne: 'REVERSED' } }).lean();
   res.json({ data: data.map((a) => ({ ...a, availableCents: a.issuedCents - a.allocatedCents - a.repaidCents })).filter((a) => a.availableCents > 0) });
 }));
 router.post('/advances', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
-  const input = z.object({ idempotencyKey: z.string().uuid(), supplierId: z.string(), issuedCents: z.number().int().positive(), issuedAt: z.coerce.date(), paymentMethod: z.enum(['CASH', 'BANK']), referenceNumber: z.string().optional(), description: z.string().optional(), approvedBy: z.string() }).parse(req.body);
-  const existing = await SupplierAdvance.findOne({ idempotencyKey: input.idempotencyKey });
-  if (existing) { res.json({ data: existing }); return; }
-  const session = await mongoose.startSession();
-  try {
-    let advance: any;
-    await session.withTransaction(async () => {
-      if (!await Supplier.exists({ _id: input.supplierId, active: true }).session(session)) throw new AppError(404, 'SUPPLIER_NOT_FOUND', 'Active supplier not found');
-      const created = await SupplierAdvance.create([{ ...input, issuedBy: req.user.id }], { session });
-      advance = created[0];
-      await SupplierLedgerEntry.create([{ supplierId: input.supplierId, eventAt: input.issuedAt, type: 'ADVANCE_ISSUED', payableDeltaCents: 0, advanceDeltaCents: input.issuedCents, referenceType: 'SupplierAdvance', referenceId: advance._id, createdBy: req.user.id }], { session });
-      await AuditLog.create([{ actorId: req.user.id, action: 'SUPPLIER_ADVANCE_ISSUED', entityType: 'SupplierAdvance', entityId: advance._id, reason: input.description ?? 'Supplier advance', after: { supplierId: input.supplierId, issuedCents: input.issuedCents, issuedAt: input.issuedAt, paymentMethod: input.paymentMethod, referenceNumber: input.referenceNumber } }], { session });
-    });
-    res.status(201).json({ data: advance });
-  } catch (error) {
-    if ((error as { code?: number }).code === 11000) {
-      const duplicate = await SupplierAdvance.findOne({ idempotencyKey: input.idempotencyKey });
-      if (duplicate) { res.json({ data: duplicate }); return; }
-    }
-    throw error;
-  } finally { await session.endSession(); }
+  const input = z.object({ idempotencyKey: z.string().uuid(), supplierId: z.string().min(1), issuedCents: z.number().int().positive(), issuedAt: z.coerce.date(), paymentMethod: z.enum(['CASH', 'BANK']), accountId: z.string().min(1), referenceNumber: z.string().max(100).optional(), description: z.string().max(500).optional() }).parse(req.body);
+  res.status(201).json({ data: await issueSupplierAdvance({ ...input, approvedBy: req.user!.id }, req.user!) });
+}));
+router.get('/advances', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
+  const filter = req.query.supplierId ? { supplierId: String(req.query.supplierId) } : {};
+  res.json({ data: await SupplierAdvance.find(filter).sort({ issuedAt: -1 }).populate('supplierId', 'code name').populate('accountId', 'code name type').lean() });
+}));
+router.get('/advances/:id/history', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
+  const [advance, allocations, repayments] = await Promise.all([
+    SupplierAdvance.findById(req.params.id).populate('supplierId', 'code name').lean(),
+    AdvanceAllocation.find({ advanceId: req.params.id }).sort({ createdAt: 1 }).lean(),
+    AdvanceRepayment.find({ advanceId: req.params.id }).sort({ eventAt: 1 }).lean(),
+  ]);
+  if (!advance) throw new AppError(404, 'ADVANCE_NOT_FOUND', 'Supplier advance not found');
+  res.json({ data: { advance, allocations, repayments } });
+}));
+router.post('/advances/:id/repayments', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), amountCents: z.number().int().positive(), accountId: z.string().min(1), paymentMethod: z.enum(['CASH', 'BANK']), eventAt: z.coerce.date(), referenceNumber: z.string().max(100).optional(), description: z.string().max(500).optional() }).parse(req.body);
+  res.status(201).json({ data: await recordAdvanceRepayment({ ...input, advanceId: req.params.id }, req.user!) });
+}));
+router.get('/advance-repayments', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (_req, res) => {
+  res.json({ data: await AdvanceRepayment.find().sort({ eventAt: -1 }).limit(200).populate('supplierId', 'code name').populate('accountId', 'code name type').lean() });
+}));
+router.post('/advance-repayments/:id/reverse', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(3).max(500), eventAt: z.coerce.date() }).parse(req.body);
+  res.json({ data: await reverseAdvanceRepayment(req.params.id, input, req.user!) });
+}));
+router.post('/advances/:id/reverse', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(3).max(500), eventAt: z.coerce.date() }).parse(req.body);
+  res.json({ data: await reverseSupplierAdvance(req.params.id, input, req.user!) });
+}));
+router.post('/advance-allocations/:id/reverse', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(3).max(500), eventAt: z.coerce.date() }).parse(req.body);
+  res.json({ data: await reverseAdvanceAllocation(req.params.id, input, req.user!) });
+}));
+
+router.post('/supplier-payments', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({
+    idempotencyKey: z.string().uuid(), supplierId: z.string().min(1), amountCents: z.number().int().positive(), paymentMethod: z.enum(['CASH', 'BANK']), accountId: z.string().min(1), eventAt: z.coerce.date(),
+    referenceNumber: z.string().max(100).optional(), description: z.string().max(500).optional(), allocations: z.array(z.object({ purchaseId: z.string().min(1), amountCents: z.number().int().positive() })).min(1),
+  }).parse(req.body);
+  res.status(201).json({ data: await postSupplierPayment({ ...input, approvedBy: req.user!.id }, req.user!) });
+}));
+router.get('/supplier-payments', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
+  const filter = req.query.supplierId ? { supplierId: String(req.query.supplierId) } : {};
+  res.json({ data: await SupplierPayment.find(filter).sort({ eventAt: -1 }).populate('supplierId', 'code name').populate('accountId', 'code name type').lean() });
+}));
+router.post('/supplier-payments/:id/reverse', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(3).max(500), eventAt: z.coerce.date() }).parse(req.body);
+  res.json({ data: await reverseSupplierPayment(req.params.id, input, req.user!) });
+}));
+
+router.post('/cash-accounts', allow('ADMIN', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), code: z.string().min(2).max(30), name: z.string().min(2).max(120), type: z.enum(['CASH', 'BANK']), openingBalanceCents: z.number().int() }).parse(req.body);
+  res.status(201).json({ data: await createCashBankAccount(input, req.user!) });
+}));
+router.get('/cash-accounts', allow('ADMIN', 'MANAGER', 'CASHIER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (_req, res) => res.json({ data: await listCashBankAccountsWithBalances() })));
+router.get('/cash-transactions', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
+  const page = Math.max(1, Number(req.query.page ?? 1));
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 50)));
+  const filter: Record<string, unknown> = {};
+  if (req.query.accountId) filter.accountId = String(req.query.accountId);
+  if (req.query.from || req.query.to) filter.eventAt = { ...(req.query.from ? { $gte: new Date(String(req.query.from)) } : {}), ...(req.query.to ? { $lte: new Date(String(req.query.to)) } : {}) };
+  const [data, total] = await Promise.all([CashBankTransaction.find(filter).sort({ eventAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).populate('accountId', 'code name type').populate('shiftId', 'shiftNumber').lean(), CashBankTransaction.countDocuments(filter)]);
+  res.json({ data, pagination: { page, limit, total, pages: Math.ceil(total / limit) } });
+}));
+
+router.post('/cashier-shifts/open', allow('ADMIN', 'MANAGER', 'CASHIER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), accountId: z.string().min(1), locationId: z.string().min(1).default('MAIN'), openedAt: z.coerce.date(), openingFloatCents: z.number().int().nonnegative(), openingNotes: z.string().max(500).optional() }).parse(req.body);
+  res.status(201).json({ data: await openCashierShift(input, req.user!) });
+}));
+router.get('/cashier-shifts/current', allow('ADMIN', 'MANAGER', 'CASHIER', 'ACCOUNTANT'), asyncRoute(async (req, res) => res.json({ data: await CashierShift.findOne({ cashierId: req.user!.id, status: 'OPEN' }).populate('accountId', 'code name type').lean() })));
+router.post('/cashier-shifts/:id/close', allow('ADMIN', 'MANAGER', 'CASHIER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), countedCashCents: z.number().int().nonnegative(), closedAt: z.coerce.date(), closingNotes: z.string().max(500).optional() }).parse(req.body);
+  res.json({ data: await closeCashierShift(req.params.id, input, req.user!) });
+}));
+router.get('/cashier-shifts', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
+  const filter = req.query.status ? { status: z.enum(['OPEN', 'CLOSED']).parse(req.query.status) } : {};
+  res.json({ data: await CashierShift.find(filter).sort({ openedAt: -1 }).limit(200).populate('cashierId', 'name role').populate('accountId', 'code name').lean() });
 }));
 
 router.get('/inventory', asyncRoute(async (_req, res) => {
@@ -124,6 +193,33 @@ router.post('/dispatches/confirm', allow('ADMIN', 'MANAGER'), asyncRoute(async (
 }));
 router.get('/dispatches', asyncRoute(async (_req, res) => res.json({ data: await DispatchBatch.find().sort({ dispatchedAt: -1 }).populate('buyerId', 'name').lean() })));
 router.get('/buyers', asyncRoute(async (_req, res) => res.json({ data: await BuyerCompany.find({ active: true }).sort({ name: 1 }).lean() })));
+router.get('/buyers/:id/statement', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
+  const entries = await BuyerLedgerEntry.find({ buyerId: req.params.id }).sort({ eventAt: 1, _id: 1 }).lean();
+  let receivableCents = 0;
+  res.json({ data: entries.map((entry) => ({ ...entry, receivableBalanceCents: receivableCents += entry.receivableDeltaCents })), summary: { receivableCents } });
+}));
+router.post('/company-invoices', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), dispatchId: z.string().min(1), issuedAt: z.coerce.date(), notes: z.string().max(500).optional() }).parse(req.body);
+  res.status(201).json({ data: await createCompanyInvoice(input, req.user!) });
+}));
+router.get('/company-invoices', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
+  const filter: Record<string, unknown> = {};
+  if (req.query.buyerId) filter.buyerId = String(req.query.buyerId);
+  if (req.query.status) filter.status = z.enum(['UNPAID', 'PARTIALLY_PAID', 'PAID']).parse(req.query.status);
+  res.json({ data: await CompanyInvoice.find(filter).sort({ issuedAt: -1 }).populate('buyerId', 'name').populate('dispatchId', 'dispatchNumber vehicleNumber acceptedKgMilli').lean() });
+}));
+router.post('/company-settlements', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), invoiceId: z.string().min(1), amountCents: z.number().int().positive(), accountId: z.string().min(1), paymentMethod: z.enum(['CASH', 'BANK']), eventAt: z.coerce.date(), referenceNumber: z.string().max(100).optional(), description: z.string().max(500).optional() }).parse(req.body);
+  res.status(201).json({ data: await postCompanySettlement(input, req.user!) });
+}));
+router.get('/company-settlements', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
+  const filter = req.query.buyerId ? { buyerId: String(req.query.buyerId) } : {};
+  res.json({ data: await CompanySettlement.find(filter).sort({ eventAt: -1 }).populate('buyerId', 'name').populate('invoiceId', 'invoiceNumber').populate('accountId', 'code name type').lean() });
+}));
+router.post('/company-settlements/:id/reverse', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(3).max(500), eventAt: z.coerce.date() }).parse(req.body);
+  res.json({ data: await reverseCompanySettlement(req.params.id, input, req.user!) });
+}));
 
 router.get('/dashboard', asyncRoute(async (_req, res) => {
   const now = new Date();

@@ -1,7 +1,7 @@
 import argon2 from 'argon2';
 import { DEFAULT_DENSITY_FACTORS } from '@latex/domain';
 import { connectDatabase, disconnectDatabase } from './db.js';
-import { BuyerCompany, DensityFactorVersion, PurchaseRate, Supplier, User } from './models.js';
+import { BuyerCompany, CashBankAccount, DensityFactorVersion, PurchaseRate, Supplier, User } from './models.js';
 import { config } from './config.js';
 
 if (config.NODE_ENV === 'production' || !config.MONGODB_URI.includes('dev')) throw new Error('Seed is restricted to a database URI containing "dev"');
@@ -19,5 +19,7 @@ for (const supplier of [
 if (!await DensityFactorVersion.exists({})) await DensityFactorVersion.create({ version: 1, effectiveFrom: new Date('2020-01-01T00:00:00+05:30'), entries: Object.entries(DEFAULT_DENSITY_FACTORS).map(([reading, factorMilli]) => ({ reading: Number(reading), factorMilli })), createdBy: admin._id, reason: 'Initial business-supplied conversion table' });
 if (!await PurchaseRate.exists({})) await PurchaseRate.create({ effectiveFrom: new Date('2026-10-20T00:00:00+05:30'), rateCentsPerKg: 82_000, createdBy: admin._id, reason: 'Demo purchase rate' });
 await BuyerCompany.updateOne({ name: 'Ceylon Rubber Processors PLC' }, { $setOnInsert: { name: 'Ceylon Rubber Processors PLC', contact: '0112345678', settlementTerms: '14 days' } }, { upsert: true });
+await CashBankAccount.updateOne({ code: 'CASH-MAIN' }, { $setOnInsert: { code: 'CASH-MAIN', name: 'Main Cash Drawer', type: 'CASH', openingBalanceCents: 0, active: true, createdBy: admin._id } }, { upsert: true });
+await CashBankAccount.updateOne({ code: 'BANK-MAIN' }, { $setOnInsert: { code: 'BANK-MAIN', name: 'Main Bank Account', type: 'BANK', openingBalanceCents: 0, active: true, createdBy: admin._id } }, { upsert: true });
 console.log('Development seed complete. Password was read from DEV_SEED_PASSWORD and was not printed.');
 await disconnectDatabase();

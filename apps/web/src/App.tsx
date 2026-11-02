@@ -11,6 +11,10 @@ import { Dispatches } from './pages/Dispatches';
 import { Rates } from './pages/Rates';
 import { Suppliers } from './pages/Suppliers';
 import { Placeholder } from './pages/Placeholder';
+import { CashBank } from './pages/CashBank';
+import { Payments } from './pages/Payments';
+import { Advances } from './pages/Advances';
+import { CompanySales } from './pages/CompanySales';
 
 export type SessionUser = { id: string; name: string; role: string };
 export default function App() {
@@ -25,6 +29,10 @@ export default function App() {
     <Route path="/suppliers" element={<Suppliers />} />
     <Route path="/rates" element={<Rates />} />
     <Route path="/dispatches" element={<Dispatches />} />
+    <Route path="/payments" element={<Payments />} />
+    <Route path="/advances" element={<Advances />} />
+    <Route path="/cash-bank" element={<CashBank />} />
+    <Route path="/sales" element={<CompanySales />} />
     <Route path="/:section" element={<Placeholder />} />
     <Route path="*" element={<Navigate to="/" replace />} />
   </Routes></AppShell>;

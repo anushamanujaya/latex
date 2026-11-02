@@ -16,14 +16,19 @@ Audit date: 2026-11-02. Scope: the complete repository, including workspace/pack
 - Purchase creation and dispatch confirmation now write audit records inside their MongoDB transactions.
 - HTTP logs redact authorization, cookie, and `Set-Cookie` values before they reach platform logs.
 - The repository pins Node 24.x so a platform runtime change cannot silently move the financial application to another major version.
+- Phase A now has transactional, idempotent supplier payment allocation and compensating reversal records. Reversals restore purchase liabilities without changing the original purchase cost.
+- Supplier advances now post to a cash/bank account and supplier ledger; purchase recovery, direct repayment, repayment reversal, allocation reversal, and unused-advance reversal preserve their original records.
+- Cash/bank accounts use signed immutable movements. Cash operations require an open cashier shift, and closing stores expected cash, counted cash, variance, and supervisor-controlled variance posting.
+- Company invoices create buyer receivables from finalized dispatch revenue. Partial receipts and receipt reversals update the receivable and cash/bank ledgers atomically.
+- Functional Phase A screens replace the placeholders for payments, advances, cash/bank reconciliation, and company sales.
 
 ## Critical production blockers still open
 
 The application must **not** be handed to a real financial customer yet.
 
-1. Controlled purchase/payment reversal and replacement workflows are absent. Confirmed financial records cannot yet be corrected safely through the UI/API.
-2. Supplier payments after initial purchase, advance issuance, and all cash/bank postings are not consistently covered by idempotency keys and multi-document transactions. The current advance endpoint can leave a ledger mismatch if its second write fails.
-3. Company settlements, buyer receivables, cashier shifts, expenses, cash reconciliation, inventory adjustments, and several models named in the original architecture are not implemented.
+1. Controlled purchase reversal and replacement remains absent. Supplier-payment corrections are implemented, but an erroneous original purchase still cannot be corrected safely through the UI/API.
+2. Expense posting, cash/bank transfers, cheque lifecycle, and a formal chart of accounts are not implemented. The Phase A ledger currently covers purchases, supplier payments, advances, company receipts, opening balances, reversals, and cashier variance.
+3. Inventory adjustments and several models named in the original architecture are not implemented. Company invoicing currently depends on dispatch values captured at confirmation; the full weighbridge reconciliation workflow is Phase B.
 4. Dispatch reconciliation/finalization, weighbridge adjustments, returns, and explicit backdated-purchase reconciliation are incomplete.
 5. Many navigation entries are deliberate placeholders. Report exports, statements, PDF/Excel output, and most analytics are not working modules. The dashboard collection chart still uses static illustrative trend data.
 6. The full 24-case financial/integration/E2E acceptance matrix has not been implemented. No real replica-set transaction rollback or concurrent dispatch test has run in this environment.
@@ -48,7 +53,9 @@ Staging deployment is appropriate for engineering verification with synthetic da
 - TypeScript checks: API, web, and shared domain passed.
 - Production builds: API and Vite web passed with an explicit staging `VITE_API_URL`.
 - Exact Vercel root-directory commands: both `npm run vercel-build` scripts passed when invoked from their application directories.
-- Automated tests: 12 passed (7 financial/domain, 4 API/security, 1 frontend formatting).
+- Baseline automated tests: 12 passed (7 financial/domain, 4 API/security, 1 frontend formatting). The opt-in Phase A replica-set suite adds 6 passing transactional scenarios.
+- Phase A replica-set acceptance: supplier payment/idempotent retry/reversal, advance repayment, allocation reversal, advance reversal, repayment reversal, company invoice/partial receipt/receipt reversal, and exact shift reconciliation passed against `latex_phase_a_test`. Synthetic test records were retained.
+- Phase A type checks passed for domain, API, and web. The production web build passed at 736.92 kB (218.11 kB gzip) and still triggers the large initial-chunk warning assigned to Phase D.
 - Production configuration guard: unsafe localhost/insecure defaults were rejected; a valid-shaped Atlas/HTTPS configuration was accepted.
 - Dependency audit: `npm audit --omit=dev` reported zero vulnerabilities at audit time.
 - Local replica-set smoke test: readiness and authentication passed. The canonical 10 L / reading 150 / LKR 820 purchase persisted as 4.000 KG and LKR 3,280.00. An identical idempotency retry returned the same purchase.

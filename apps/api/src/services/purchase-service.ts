@@ -1,7 +1,7 @@
 import mongoose, { type ClientSession } from 'mongoose';
 import { calculatePurchase, calculateSettlement } from '@latex/domain';
 import { AppError, type AuthUser } from '../http.js';
-import { AdvanceAllocation, AuditLog, Counter, DensityFactorVersion, Purchase, PurchaseRate, Supplier, SupplierAdvance, SupplierLedgerEntry } from '../models.js';
+import { AdvanceAllocation, AuditLog, CashBankTransaction, CashierShift, Counter, DensityFactorVersion, Purchase, PurchaseRate, Supplier, SupplierAdvance, SupplierLedgerEntry } from '../models.js';
 
 export interface CreatePurchaseInput {
   idempotencyKey: string; locationId: string; supplierId: string; eventAt: Date; litresMilli: number; densityReading: number;
@@ -45,9 +45,14 @@ export async function createPurchase(input: CreatePurchaseInput, actor: AuthUser
       result = docs[0];
       if (!result) throw new AppError(500, 'PURCHASE_CREATE_FAILED', 'Purchase was not created');
       await SupplierLedgerEntry.create([{ supplierId: input.supplierId, eventAt: input.eventAt, type: 'PURCHASE_OBLIGATION', payableDeltaCents: calculated.totalCents, advanceDeltaCents: 0, referenceType: 'Purchase', referenceId: result._id, createdBy: actor.id }], { session });
-      if (input.cashPaidCents > 0) await SupplierLedgerEntry.create([{ supplierId: input.supplierId, eventAt: input.eventAt, type: 'PAYMENT', payableDeltaCents: -input.cashPaidCents, advanceDeltaCents: 0, referenceType: 'Purchase', referenceId: result._id, createdBy: actor.id }], { session });
+      if (input.cashPaidCents > 0) {
+        const shift = await CashierShift.findOne({ cashierId: actor.id, status: 'OPEN' }).session(session);
+        if (!shift) throw new AppError(409, 'SHIFT_REQUIRED', 'Open a cashier shift before paying cash for a purchase');
+        await SupplierLedgerEntry.create([{ supplierId: input.supplierId, eventAt: input.eventAt, type: 'PAYMENT', payableDeltaCents: -input.cashPaidCents, advanceDeltaCents: 0, referenceType: 'Purchase', referenceId: result._id, createdBy: actor.id }], { session });
+        await CashBankTransaction.create([{ idempotencyKey: `${input.idempotencyKey}:cash`, accountId: shift.accountId, shiftId: shift._id, eventAt: input.eventAt, type: 'PURCHASE_CASH_PAYMENT', signedAmountCents: -input.cashPaidCents, referenceType: 'Purchase', referenceId: result._id, description: `Cash settlement for ${result.billNumber}`, createdBy: actor.id }], { session });
+      }
       for (const allocation of input.advanceApplications) {
-        const updated = await SupplierAdvance.findOneAndUpdate({ _id: allocation.advanceId, supplierId: input.supplierId, $expr: { $gte: [{ $subtract: ['$issuedCents', { $add: ['$allocatedCents', '$repaidCents'] }] }, allocation.amountCents] } }, { $inc: { allocatedCents: allocation.amountCents } }, { returnDocument: 'after', session });
+        const updated = await SupplierAdvance.findOneAndUpdate({ _id: allocation.advanceId, supplierId: input.supplierId, status: { $ne: 'REVERSED' }, $expr: { $gte: [{ $subtract: ['$issuedCents', { $add: ['$allocatedCents', '$repaidCents'] }] }, allocation.amountCents] } }, { $inc: { allocatedCents: allocation.amountCents } }, { returnDocument: 'after', session });
         if (!updated) throw new AppError(409, 'ADVANCE_UNAVAILABLE', 'Advance has insufficient available balance');
         await AdvanceAllocation.create([{ advanceId: allocation.advanceId, purchaseId: result._id, amountCents: allocation.amountCents, allocatedBy: actor.id }], { session });
         await SupplierLedgerEntry.create([{ supplierId: input.supplierId, eventAt: input.eventAt, type: 'ADVANCE_ALLOCATED', payableDeltaCents: -allocation.amountCents, advanceDeltaCents: -allocation.amountCents, referenceType: 'Purchase', referenceId: result._id, createdBy: actor.id }], { session });
