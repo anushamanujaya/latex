@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { calculatePurchase, calculateSettlement, DEFAULT_DENSITY_FACTORS, factorForReading } from './latex.js';
-import { assertContiguousDispatchBoundary, calculateDispatchProfit } from './dispatch.js';
+import { assertContiguousDispatchBoundary, calculateDispatchMetrics, calculateDispatchProfit } from './dispatch.js';
 
 describe('latex business arithmetic', () => {
   it('calculates the canonical purchase without floating point money', () => {
@@ -18,6 +18,13 @@ describe('latex business arithmetic', () => {
   it('calculates finalized batch profit', () => {
     expect(calculateDispatchProfit({ purchaseCostCents: 82_000_000, acceptedKgMilli: 1_000_000, sellingRateCentsPerKg: 90_000, expenseCents: 500_000 })).toEqual({
       revenueCents: 90_000_000, grossProfitCents: 8_000_000, netProfitCents: 7_500_000,
+    });
+  });
+
+  it('calculates reconciled quantity, unit cost, margin and net profit exactly', () => {
+    expect(calculateDispatchMetrics({ acquiredKgMilli: 1_000_000, acceptedKgMilli: 980_000, purchaseCostCents: 82_000_000, sellingRateCentsPerKg: 90_000, directExpenseCents: 500_000 })).toEqual({
+      revenueCents: 88_200_000, grossProfitCents: 6_200_000, netProfitCents: 5_700_000,
+      quantityVarianceMilli: -20_000, quantityVarianceBasisPoints: -200, profitMarginBasisPoints: 646, costPerAcquiredKgCents: 82_000,
     });
   });
 

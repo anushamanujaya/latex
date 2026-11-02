@@ -311,11 +311,11 @@ export async function createCompanyInvoice(input: { idempotencyKey: string; disp
   try {
     let invoice: any;
     await session.withTransaction(async () => {
-      const dispatch = await DispatchBatch.findOne({ _id: input.dispatchId, status: { $in: ['CONFIRMED', 'FINALIZED'] }, revenueCents: { $gte: 0 }, acceptedKgMilli: { $gte: 0 }, sellingRateCentsPerKg: { $gte: 0 } }).session(session);
+      const dispatch = await DispatchBatch.findOne({ _id: input.dispatchId, status: { $in: ['RECONCILED', 'FINALIZED', 'CONFIRMED'] }, revenueCents: { $gte: 0 }, acceptedKgMilli: { $gte: 0 }, sellingRateCentsPerKg: { $gte: 0 }, reconciledAt: { $exists: true } }).session(session);
       if (!dispatch) throw new AppError(409, 'DISPATCH_NOT_INVOICEABLE', 'Dispatch requires confirmed company quantity and rate');
       const sequence = await nextCounter('company-invoice', session);
       [invoice] = await CompanyInvoice.create([{ invoiceNumber: `INV-${String(sequence).padStart(6, '0')}`, ...input, buyerId: dispatch.buyerId, totalCents: dispatch.revenueCents, outstandingCents: dispatch.revenueCents, status: dispatch.revenueCents === 0 ? 'PAID' : 'UNPAID', createdBy: actor.id }], { session });
-      if (dispatch.status === 'CONFIRMED') await DispatchBatch.updateOne({ _id: dispatch._id, status: 'CONFIRMED' }, { $set: { status: 'FINALIZED' } }, { session });
+      if (dispatch.status !== 'FINALIZED') await DispatchBatch.updateOne({ _id: dispatch._id, status: dispatch.status }, { $set: { status: 'FINALIZED' } }, { session });
       await BuyerLedgerEntry.create([{ buyerId: dispatch.buyerId, eventAt: input.issuedAt, type: 'SALE_RECEIVABLE', receivableDeltaCents: dispatch.revenueCents, referenceType: 'CompanyInvoice', referenceId: invoice._id, description: input.notes, createdBy: actor.id }], { session });
       await AuditLog.create([{ actorId: actor.id, action: 'COMPANY_INVOICE_CREATED', entityType: 'CompanyInvoice', entityId: invoice._id, reason: input.notes ?? 'Dispatch sale invoiced', after: { dispatchId: input.dispatchId, invoiceNumber: invoice.invoiceNumber, totalCents: invoice.totalCents } }], { session });
     });

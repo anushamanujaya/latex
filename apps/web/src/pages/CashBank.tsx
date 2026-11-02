@@ -12,6 +12,7 @@ export function CashBank() {
   const [accountId, setAccountId] = useState('');
   const [opening, setOpening] = useState('');
   const [counted, setCounted] = useState('');
+  const [sourceId,setSourceId]=useState(''); const [destinationId,setDestinationId]=useState(''); const [transferAmount,setTransferAmount]=useState(''); const [transferReference,setTransferReference]=useState('');
   const [message, setMessage] = useState('');
   const accounts = useQuery({ queryKey: ['cash-accounts'], queryFn: () => api<{ data: Account[] }>('/cash-accounts') });
   const shift = useQuery({ queryKey: ['current-shift'], queryFn: () => api<{ data: Shift | null }>('/cashier-shifts/current') });
@@ -19,6 +20,7 @@ export function CashBank() {
   const refresh = async () => { await Promise.all([qc.invalidateQueries({ queryKey: ['cash-accounts'] }), qc.invalidateQueries({ queryKey: ['current-shift'] }), qc.invalidateQueries({ queryKey: ['cash-transactions'] })]); };
   const open = useMutation({ mutationFn: () => api('/cashier-shifts/open', { method: 'POST', body: JSON.stringify({ idempotencyKey: crypto.randomUUID(), accountId, locationId: 'MAIN', openedAt: new Date().toISOString(), openingFloatCents: Math.round(Number(opening) * 100) }) }), onSuccess: async () => { setMessage('Cashier shift opened.'); await refresh(); }, onError: (error) => setMessage(error instanceof Error ? error.message : 'Could not open shift') });
   const close = useMutation({ mutationFn: () => api(`/cashier-shifts/${shift.data?.data?._id}/close`, { method: 'POST', body: JSON.stringify({ idempotencyKey: crypto.randomUUID(), countedCashCents: Math.round(Number(counted) * 100), closedAt: new Date().toISOString() }) }), onSuccess: async () => { setMessage('Shift closed and reconciled.'); setCounted(''); await refresh(); }, onError: (error) => setMessage(error instanceof Error ? error.message : 'Could not close shift') });
+  const transfer=useMutation({mutationFn:()=>api('/cash-transfers',{method:'POST',body:JSON.stringify({idempotencyKey:crypto.randomUUID(),sourceAccountId:sourceId,destinationAccountId:destinationId,amountCents:Math.round(Number(transferAmount)*100),eventAt:new Date().toISOString(),referenceNumber:transferReference})}),onSuccess:async()=>{setMessage('Atomic paired transfer posted.');setTransferAmount('');setTransferReference('');await refresh();},onError:e=>setMessage(e instanceof Error?e.message:'Transfer failed')});
 
   return <div><div className="mb-7"><p className="text-sm font-medium text-emerald-800">Audited liquidity</p><h1 className="mt-1 text-3xl font-semibold tracking-tight">Cash & bank ledger</h1><p className="mt-2 text-sm text-stone-500">Every receipt and payment is posted as a signed account movement.</p></div>
     {message && <div className="mb-4 rounded-xl bg-amber-50 p-3 text-sm text-amber-800">{message}</div>}
