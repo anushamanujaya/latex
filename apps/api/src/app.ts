@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
-import helmet from 'helmet';
+import * as helmetModule from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import { pinoHttp } from 'pino-http';
 import { allowedWebOrigins, config } from './config.js';
@@ -13,7 +13,7 @@ import routes from './routes.js';
 export function createApp() {
   const app = express();
   app.set('trust proxy', 1);
-  app.use(helmet());
+  app.use(helmetModule.default());
   app.use(cors({
     credentials: true,
     origin(origin, callback) {
