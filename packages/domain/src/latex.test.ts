@@ -27,6 +27,11 @@ describe('latex business arithmetic', () => {
       quantityVarianceMilli: -20_000, quantityVarianceBasisPoints: -200, profitMarginBasisPoints: 646, costPerAcquiredKgCents: 82_000,
     });
   });
+  it('keeps unit-cost and margin ratios exact when intermediate products exceed JS safe integers', () => {
+    const result = calculateDispatchMetrics({ acquiredKgMilli: 10_000_000_000_000, acceptedKgMilli: 10_000_000_000_000, purchaseCostCents: 10_000_000_000_000, sellingRateCentsPerKg: 1, directExpenseCents: 0 });
+    expect(result.costPerAcquiredKgCents).toBe(1000);
+    expect(result.profitMarginBasisPoints).toBe(-9_990_000);
+  });
 
   it('applies a prior advance without changing procurement cost', () => {
     const purchase = calculatePurchase({ litresMilli: 10_000, factorMilli: 400, rateCentsPerKg: 82_000 });

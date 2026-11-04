@@ -2,6 +2,7 @@ import mongoose, { type ClientSession } from 'mongoose';
 import { assertContiguousDispatchBoundary, calculateDispatchMetrics } from '@latex/domain';
 import { AppError, type AuthUser } from '../http.js';
 import { AuditLog, BuyerLedgerEntry, CompanyInvoice, CompanyInvoiceAdjustment, Counter, DispatchBatch, DispatchFinancialAdjustment, DispatchReconciliation, Expense, Purchase } from '../models.js';
+import { consumeApproval } from './approval-service.js';
 
 async function nextCounter(key: string, session: ClientSession) {
   const counter = await Counter.findOneAndUpdate({ key }, { $inc: { value: 1 } }, { upsert: true, returnDocument: 'after', session });
@@ -32,28 +33,35 @@ export async function previewDispatch(locationId: string, lastSequence: number, 
 
 type DraftInput = { idempotencyKey: string; locationId: string; lastSequence: number; buyerId: string; vehicleNumber: string; dispatchedAt: Date; notes?: string | undefined };
 
+function assertSameDraft(existing: any, input: DraftInput) {
+  if (existing.locationId !== input.locationId || existing.lastSequence !== input.lastSequence || String(existing.buyerId) !== input.buyerId || existing.vehicleNumber !== input.vehicleNumber) throw new AppError(409, 'IDEMPOTENCY_KEY_CONFLICT', 'Dispatch key was used for a different boundary, buyer, or vehicle');
+}
+
 export async function createDispatchDraft(input: DraftInput, actor: AuthUser) {
   const existing = await DispatchBatch.findOne({ idempotencyKey: input.idempotencyKey });
-  if (existing) return existing;
+  if (existing) { assertSameDraft(existing, input); return existing; }
   const preview = await previewDispatch(input.locationId, input.lastSequence);
   const session = await mongoose.startSession();
   try {
     let draft: any;
     await session.withTransaction(async () => {
       const sequence = await nextCounter('dispatch', session);
-      [draft] = await DispatchBatch.create([{ dispatchNumber: `DSP-${String(sequence).padStart(5, '0')}`, ...input, status: 'DRAFT', firstSequence: preview.firstSequence, purchaseCount: preview.purchases.length, totalLitresMilli: preview.totals.litresMilli, acquiredKgMilli: preview.totals.kgMilli, purchaseCostCents: preview.totals.purchaseCostCents, directExpenseCents: 0, adjustmentCents: 0 }], { session });
+      [draft] = await DispatchBatch.create([{ dispatchNumber: `DSP-${String(sequence).padStart(5, '0')}`, ...input, status: 'DRAFT', firstSequence: preview.firstSequence, purchaseCount: preview.purchases.length, purchaseIds: preview.purchases.map((purchase) => purchase._id), totalLitresMilli: preview.totals.litresMilli, acquiredKgMilli: preview.totals.kgMilli, purchaseCostCents: preview.totals.purchaseCostCents, directExpenseCents: 0, adjustmentCents: 0 }], { session });
       await AuditLog.create([{ actorId: actor.id, action: 'DISPATCH_DRAFT_CREATED', entityType: 'DispatchBatch', entityId: draft._id, reason: input.notes ?? 'Boundary draft', after: { firstSequence: draft.firstSequence, lastSequence: draft.lastSequence, purchaseCount: draft.purchaseCount } }], { session });
     });
     return draft;
   } catch (error) {
-    if ((error as { code?: number }).code === 11000) { const duplicate = await DispatchBatch.findOne({ idempotencyKey: input.idempotencyKey }); if (duplicate) return duplicate; }
+    if ((error as { code?: number }).code === 11000) { const duplicate = await DispatchBatch.findOne({ idempotencyKey: input.idempotencyKey }); if (duplicate) { assertSameDraft(duplicate, input); return duplicate; } }
     throw error;
   } finally { await session.endSession(); }
 }
 
 export async function confirmDispatchDraft(dispatchId: string, idempotencyKey: string, actor: AuthUser) {
   const repeated = await DispatchBatch.findOne({ confirmationIdempotencyKey: idempotencyKey });
-  if (repeated) return repeated;
+  if (repeated) {
+    if (String(repeated._id) !== dispatchId) throw new AppError(409, 'IDEMPOTENCY_KEY_CONFLICT', 'Confirmation key belongs to another dispatch');
+    return repeated;
+  }
   const session = await mongoose.startSession();
   try {
     let output: any;
@@ -61,7 +69,9 @@ export async function confirmDispatchDraft(dispatchId: string, idempotencyKey: s
       const draft = await DispatchBatch.findOne({ _id: dispatchId, status: 'DRAFT' }).session(session);
       if (!draft) throw new AppError(404, 'DRAFT_DISPATCH_NOT_FOUND', 'Draft dispatch not found');
       const preview = await previewDispatch(draft.locationId, draft.lastSequence, session);
-      if (preview.firstSequence !== draft.firstSequence || preview.purchases.length !== draft.purchaseCount || preview.totals.purchaseCostCents !== draft.purchaseCostCents) throw new AppError(409, 'DRAFT_STALE', 'Purchases changed after the draft; create a new preview');
+      const currentPurchaseIds = preview.purchases.map((purchase) => String(purchase._id));
+      const draftPurchaseIds = (draft.purchaseIds ?? []).map((id: unknown) => String(id));
+      if (preview.firstSequence !== draft.firstSequence || preview.purchases.length !== draft.purchaseCount || preview.totals.purchaseCostCents !== draft.purchaseCostCents || preview.totals.kgMilli !== draft.acquiredKgMilli || preview.totals.litresMilli !== draft.totalLitresMilli || (draftPurchaseIds.length > 0 && currentPurchaseIds.some((id, index) => id !== draftPurchaseIds[index]))) throw new AppError(409, 'DRAFT_STALE', 'Purchases changed after the draft; create a new preview');
       const claimed = await Purchase.updateMany({ _id: { $in: preview.purchases.map((p) => p._id) }, dispatchStatus: 'PENDING', reversedAt: { $exists: false } }, { $set: { dispatchStatus: 'ASSIGNED', dispatchId: draft._id } }, { session });
       if (claimed.modifiedCount !== preview.purchases.length) throw new AppError(409, 'DISPATCH_CONFLICT', 'Another operator changed this boundary; preview again');
       output = await DispatchBatch.findOneAndUpdate({ _id: draft._id, status: 'DRAFT' }, { $set: { status: 'CONFIRMED', confirmationIdempotencyKey: idempotencyKey, confirmedBy: actor.id, confirmedAt: new Date() } }, { returnDocument: 'after', session });
@@ -70,53 +80,62 @@ export async function confirmDispatchDraft(dispatchId: string, idempotencyKey: s
     });
     return output;
   } catch (error) {
-    if ((error as { code?: number }).code === 11000) { const duplicate = await DispatchBatch.findOne({ confirmationIdempotencyKey: idempotencyKey }); if (duplicate) return duplicate; }
+    if ((error as { code?: number }).code === 11000) { const duplicate = await DispatchBatch.findOne({ confirmationIdempotencyKey: idempotencyKey }); if (duplicate) { if (String(duplicate._id) !== dispatchId) throw new AppError(409, 'IDEMPOTENCY_KEY_CONFLICT', 'Confirmation key belongs to another dispatch'); return duplicate; } }
     throw error;
   } finally { await session.endSession(); }
 }
 
 export async function confirmDispatch(input: DraftInput & { acceptedKgMilli?: number | undefined; sellingRateCentsPerKg?: number | undefined; directExpenseCents: number }, actor: AuthUser) {
+  if (input.acceptedKgMilli !== undefined || input.sellingRateCentsPerKg !== undefined || input.directExpenseCents !== 0) throw new AppError(422, 'RECONCILIATION_REQUIRED', 'Financial values must be recorded through reconciliation and expense entries');
   const existing = await DispatchBatch.findOne({ idempotencyKey: input.idempotencyKey });
-  if (existing) return existing;
+  if (existing) { assertSameDraft(existing, input); return existing.status === 'DRAFT' ? confirmDispatchDraft(String(existing._id), `${input.idempotencyKey}:confirm`, actor) : existing; }
   const draft = await createDispatchDraft(input, actor);
   return confirmDispatchDraft(String(draft._id), `${input.idempotencyKey}:confirm`, actor);
 }
 
-export async function reconcileDispatch(input: { idempotencyKey: string; dispatchId: string; eventAt: Date; acceptedKgMilli: number; sellingRateCentsPerKg: number; weighbridgeReference: string; weighbridgeDocumentName?: string | undefined; weighbridgeDocumentUrl?: string | undefined; discrepancyReason?: string | undefined; notes?: string | undefined; approvedBy: string }, actor: AuthUser) {
-  if (await DispatchReconciliation.exists({ idempotencyKey: input.idempotencyKey })) return DispatchBatch.findById(input.dispatchId);
+export type ReconciliationInput = { idempotencyKey: string; dispatchId: string; eventAt: Date; acceptedKgMilli: number; sellingRateCentsPerKg: number; weighbridgeReference: string; weighbridgeDocumentName?: string | undefined; weighbridgeDocumentUrl?: string | undefined; discrepancyReason?: string | undefined; notes?: string | undefined; approvalId: string };
+export function reconciliationApprovalPayload(input:Omit<ReconciliationInput,'approvalId'>,sourceUpdatedAt:Date):Record<string,unknown>{
+  return {dispatchId:input.dispatchId,idempotencyKey:input.idempotencyKey,eventAt:input.eventAt.toISOString(),acceptedKgMilli:input.acceptedKgMilli,sellingRateCentsPerKg:input.sellingRateCentsPerKg,weighbridgeReference:input.weighbridgeReference,weighbridgeDocumentName:input.weighbridgeDocumentName??null,weighbridgeDocumentUrl:input.weighbridgeDocumentUrl??null,discrepancyReason:input.discrepancyReason??null,notes:input.notes??null,sourceUpdatedAt:sourceUpdatedAt.toISOString()};
+}
+export async function reconcileDispatch(input: ReconciliationInput, actor: AuthUser) {
+  const previousReconciliation = await DispatchReconciliation.findOne({ idempotencyKey: input.idempotencyKey });
+  if (previousReconciliation) {
+    if (String(previousReconciliation.dispatchId) !== input.dispatchId) throw new AppError(409, 'IDEMPOTENCY_KEY_CONFLICT', 'Reconciliation key belongs to another dispatch');
+    return DispatchBatch.findById(input.dispatchId);
+  }
   const session = await mongoose.startSession();
   try {
     let output: any;
     await session.withTransaction(async () => {
       const dispatch = await DispatchBatch.findOne({ _id: input.dispatchId, status: { $in: ['CONFIRMED', 'RECONCILED', 'FINALIZED'] } }).session(session);
       if (!dispatch) throw new AppError(404, 'DISPATCH_NOT_RECONCILABLE', 'Confirmed dispatch not found');
-      const [expenses, adjustments] = await Promise.all([
-        Expense.aggregate([{ $match: { dispatchId: dispatch._id, allocationType: 'DIRECT_DISPATCH', status: 'POSTED' } }, { $group: { _id: null, cents: { $sum: '$amountCents' } } }]).session(session),
-        DispatchFinancialAdjustment.aggregate([{ $match: { dispatchId: dispatch._id, status: 'POSTED' } }, { $group: { _id: null, cents: { $sum: '$amountCents' } } }]).session(session),
-      ]);
+      const approval=await consumeApproval({approvalId:input.approvalId,operation:'DISPATCH_RECONCILIATION',targetId:input.dispatchId,payload:reconciliationApprovalPayload(input,dispatch.updatedAt)},actor,session);
+      const expenses = await Expense.aggregate([{ $match: { dispatchId: dispatch._id, allocationType: 'DIRECT_DISPATCH', status: 'POSTED' } }, { $group: { _id: null, cents: { $sum: '$amountCents' } } }]).session(session);
+      const adjustments = await DispatchFinancialAdjustment.aggregate([{ $match: { dispatchId: dispatch._id, status: 'POSTED' } }, { $group: { _id: null, cents: { $sum: '$amountCents' } } }]).session(session);
       const directExpenseCents = expenses[0]?.cents ?? 0; const adjustmentCents = adjustments[0]?.cents ?? 0;
       const metrics = calculateDispatchMetrics({ acquiredKgMilli: dispatch.acquiredKgMilli, acceptedKgMilli: input.acceptedKgMilli, purchaseCostCents: dispatch.purchaseCostCents, sellingRateCentsPerKg: input.sellingRateCentsPerKg, directExpenseCents, adjustmentCents });
       if (metrics.quantityVarianceMilli !== 0 && !input.discrepancyReason) throw new AppError(422, 'DISCREPANCY_REASON_REQUIRED', 'A quantity discrepancy reason is required');
       const version = await DispatchReconciliation.countDocuments({ dispatchId: dispatch._id }).session(session) + 1;
       const before = { acceptedKgMilli: dispatch.acceptedKgMilli, sellingRateCentsPerKg: dispatch.sellingRateCentsPerKg, revenueCents: dispatch.revenueCents, netProfitCents: dispatch.netProfitCents };
-      await DispatchReconciliation.create([{ ...input, version, quantityVarianceMilli: metrics.quantityVarianceMilli, quantityVarianceBasisPoints: metrics.quantityVarianceBasisPoints, previousSnapshot: before, resultingSnapshot: metrics, operatorId: actor.id }], { session });
+      await DispatchReconciliation.create([{ ...input, approvedBy:approval.decidedBy, version, quantityVarianceMilli: metrics.quantityVarianceMilli, quantityVarianceBasisPoints: metrics.quantityVarianceBasisPoints, previousSnapshot: before, resultingSnapshot: metrics, operatorId: actor.id }], { session });
       const invoice = await CompanyInvoice.findOne({ dispatchId: dispatch._id }).session(session);
       if (invoice && dispatch.revenueCents !== undefined && dispatch.revenueCents !== metrics.revenueCents) {
         const delta = metrics.revenueCents - dispatch.revenueCents; const newTotal = invoice.totalCents + delta;
-        if (newTotal < 0) throw new AppError(409, 'INVOICE_ADJUSTMENT_CONFLICT', 'Reconciliation would make invoice total negative');
-        const newOutstanding = Math.max(0, invoice.outstandingCents + delta);
-        await CompanyInvoice.updateOne({ _id: invoice._id }, { $set: { totalCents: newTotal, outstandingCents: newOutstanding, status: newOutstanding === 0 ? 'PAID' : newOutstanding === newTotal ? 'UNPAID' : 'PARTIALLY_PAID' } }, { session });
+        const netReceivable = invoice.outstandingCents - (invoice.refundDueCents ?? 0) + delta;
+        const newOutstanding = Math.max(netReceivable, 0);
+        const refundDueCents = Math.max(-netReceivable, 0);
+        await CompanyInvoice.updateOne({ _id: invoice._id }, { $set: { totalCents: newTotal, outstandingCents: newOutstanding, refundDueCents, status: refundDueCents > 0 ? 'REFUND_DUE' : newOutstanding === 0 ? 'PAID' : newOutstanding === newTotal ? 'UNPAID' : 'PARTIALLY_PAID' } }, { session });
         const number = await nextCounter('company-invoice-adjustment', session);
         const [adjustment] = await CompanyInvoiceAdjustment.create([{ adjustmentNumber: `CIA-${String(number).padStart(6, '0')}`, idempotencyKey: `${input.idempotencyKey}:invoice`, invoiceId: invoice._id, dispatchId: dispatch._id, buyerId: invoice.buyerId, amountCents: delta, type: delta >= 0 ? 'DEBIT' : 'CREDIT', eventAt: input.eventAt, reason: input.discrepancyReason ?? 'Dispatch reconciliation amendment', createdBy: actor.id }], { session });
         await BuyerLedgerEntry.create([{ buyerId: invoice.buyerId, eventAt: input.eventAt, type: 'ADJUSTMENT', receivableDeltaCents: delta, referenceType: 'CompanyInvoiceAdjustment', referenceId: adjustment._id, description: adjustment.reason, createdBy: actor.id }], { session });
       }
-      output = await DispatchBatch.findOneAndUpdate({ _id: dispatch._id, status: dispatch.status }, { $set: { status: invoice ? 'FINALIZED' : 'RECONCILED', acceptedKgMilli: input.acceptedKgMilli, sellingRateCentsPerKg: input.sellingRateCentsPerKg, weighbridgeReference: input.weighbridgeReference, weighbridgeDocumentName: input.weighbridgeDocumentName, weighbridgeDocumentUrl: input.weighbridgeDocumentUrl, reconciledAt: input.eventAt, reconciledBy: actor.id, reconciliationApprovedBy: input.approvedBy, directExpenseCents, adjustmentCents, ...metrics } }, { returnDocument: 'after', session });
+      output = await DispatchBatch.findOneAndUpdate({ _id: dispatch._id, status: dispatch.status }, { $set: { status: invoice ? 'FINALIZED' : 'RECONCILED', acceptedKgMilli: input.acceptedKgMilli, sellingRateCentsPerKg: input.sellingRateCentsPerKg, weighbridgeReference: input.weighbridgeReference, weighbridgeDocumentName: input.weighbridgeDocumentName, weighbridgeDocumentUrl: input.weighbridgeDocumentUrl, reconciledAt: input.eventAt, reconciledBy: actor.id, reconciliationApprovedBy: approval.decidedBy, directExpenseCents, adjustmentCents, ...metrics } }, { returnDocument: 'after', session });
       if (!output) throw new AppError(409, 'RECONCILIATION_CONFLICT', 'Dispatch changed during reconciliation');
       await AuditLog.create([{ actorId: actor.id, action: version === 1 ? 'DISPATCH_RECONCILED' : 'DISPATCH_RECONCILIATION_CORRECTED', entityType: 'DispatchBatch', entityId: dispatch._id, reason: input.discrepancyReason ?? input.notes ?? 'Company weighbridge reconciliation', before, after: { version, ...metrics } }], { session });
     });
     return output;
   } catch (error) {
-    if ((error as { code?: number }).code === 11000 && await DispatchReconciliation.exists({ idempotencyKey: input.idempotencyKey })) return DispatchBatch.findById(input.dispatchId);
+    if ((error as { code?: number }).code === 11000) { const duplicate = await DispatchReconciliation.findOne({ idempotencyKey: input.idempotencyKey }); if (duplicate) { if (String(duplicate.dispatchId) !== input.dispatchId) throw new AppError(409, 'IDEMPOTENCY_KEY_CONFLICT', 'Reconciliation key belongs to another dispatch'); return DispatchBatch.findById(input.dispatchId); } }
     throw error;
   } finally { await session.endSession(); }
 }

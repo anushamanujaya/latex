@@ -4,6 +4,8 @@ import {
   AdvanceAllocation, AdvanceRepayment, AuditLog, BuyerLedgerEntry, CashBankAccount, CashBankTransaction, CashierShift,
   CompanyInvoice, CompanySettlement, Counter, DispatchBatch, Purchase, Supplier, SupplierAdvance, SupplierLedgerEntry, SupplierPayment,
 } from '../models.js';
+import { postCashBankMovement } from './cash-bank-policy.js';
+import { consumeReversalApproval, requireFinancialRole, type ReversalInput } from './approval-service.js';
 
 type PaymentMethod = 'CASH' | 'BANK';
 
@@ -31,12 +33,8 @@ async function createCashMovement(args: {
   idempotencyKey: string; accountId: unknown; shiftId?: unknown; eventAt: Date; type: string; signedAmountCents: number;
   referenceType: string; referenceId: unknown; description?: string | undefined; actorId: string; session: ClientSession;
 }) {
-  const docs = await CashBankTransaction.create([{
-    idempotencyKey: args.idempotencyKey, accountId: args.accountId, shiftId: args.shiftId, eventAt: args.eventAt, type: args.type,
-    signedAmountCents: args.signedAmountCents, referenceType: args.referenceType, referenceId: args.referenceId,
-    description: args.description, createdBy: args.actorId,
-  }], { session: args.session });
-  return docs[0];
+  const { session, ...movement } = args;
+  return postCashBankMovement(movement, session);
 }
 
 export async function createCashBankAccount(input: { idempotencyKey: string; code: string; name: string; type: PaymentMethod; openingBalanceCents: number }, actor: AuthUser) {
@@ -161,7 +159,8 @@ export async function postSupplierPayment(input: { idempotencyKey: string; suppl
   } finally { await session.endSession(); }
 }
 
-export async function reverseSupplierPayment(paymentId: string, input: { idempotencyKey: string; reason: string; eventAt: Date }, actor: AuthUser) {
+export async function reverseSupplierPayment(paymentId: string, input: ReversalInput, actor: AuthUser) {
+  requireFinancialRole(actor);
   const duplicate = await SupplierPayment.findOne({ reversalIdempotencyKey: input.idempotencyKey });
   if (duplicate) return duplicate;
   const session = await mongoose.startSession();
@@ -170,6 +169,7 @@ export async function reverseSupplierPayment(paymentId: string, input: { idempot
     await session.withTransaction(async () => {
       const payment = await SupplierPayment.findOne({ _id: paymentId, status: 'POSTED' }).session(session);
       if (!payment) throw new AppError(404, 'POSTED_PAYMENT_NOT_FOUND', 'Posted supplier payment not found');
+      await consumeReversalApproval('SUPPLIER_PAYMENT', paymentId, input, payment.updatedAt, actor, session);
       const reversalShift = await requireShift(payment.paymentMethod, String(payment.accountId), actor, session);
       for (const allocation of payment.allocations) {
         const purchase = await Purchase.findOneAndUpdate(
@@ -235,7 +235,8 @@ export async function recordAdvanceRepayment(input: { idempotencyKey: string; ad
   } finally { await session.endSession(); }
 }
 
-export async function reverseAdvanceRepayment(repaymentId: string, input: { idempotencyKey: string; reason: string; eventAt: Date }, actor: AuthUser) {
+export async function reverseAdvanceRepayment(repaymentId: string, input: ReversalInput, actor: AuthUser) {
+  requireFinancialRole(actor);
   const duplicate = await AdvanceRepayment.findOne({ reversalIdempotencyKey: input.idempotencyKey });
   if (duplicate) return duplicate;
   const session = await mongoose.startSession();
@@ -244,6 +245,7 @@ export async function reverseAdvanceRepayment(repaymentId: string, input: { idem
     await session.withTransaction(async () => {
       const repayment = await AdvanceRepayment.findOne({ _id: repaymentId, status: 'POSTED' }).session(session);
       if (!repayment) throw new AppError(404, 'POSTED_REPAYMENT_NOT_FOUND', 'Posted advance repayment not found');
+      await consumeReversalApproval('ADVANCE_REPAYMENT', repaymentId, input, repayment.updatedAt, actor, session);
       const reversalShift = await requireShift(repayment.paymentMethod, String(repayment.accountId), actor, session);
       const advance = await SupplierAdvance.findOneAndUpdate({ _id: repayment.advanceId, status: { $ne: 'REVERSED' }, repaidCents: { $gte: repayment.amountCents } }, { $inc: { repaidCents: -repayment.amountCents } }, { returnDocument: 'after', session });
       if (!advance) throw new AppError(409, 'REPAYMENT_REVERSAL_CONFLICT', 'Advance balance no longer permits this reversal');
@@ -257,7 +259,8 @@ export async function reverseAdvanceRepayment(repaymentId: string, input: { idem
   } finally { await session.endSession(); }
 }
 
-export async function reverseSupplierAdvance(advanceId: string, input: { idempotencyKey: string; reason: string; eventAt: Date }, actor: AuthUser) {
+export async function reverseSupplierAdvance(advanceId: string, input: ReversalInput, actor: AuthUser) {
+  requireFinancialRole(actor);
   const duplicate = await SupplierAdvance.findOne({ reversalIdempotencyKey: input.idempotencyKey });
   if (duplicate) return duplicate;
   const session = await mongoose.startSession();
@@ -266,6 +269,7 @@ export async function reverseSupplierAdvance(advanceId: string, input: { idempot
     await session.withTransaction(async () => {
       const advance = await SupplierAdvance.findOne({ _id: advanceId, status: 'ACTIVE' }).session(session);
       if (!advance) throw new AppError(404, 'ACTIVE_ADVANCE_NOT_FOUND', 'Active supplier advance not found');
+      await consumeReversalApproval('SUPPLIER_ADVANCE', advanceId, input, advance.updatedAt, actor, session);
       if (advance.allocatedCents !== 0 || advance.repaidCents !== 0) throw new AppError(409, 'ADVANCE_REVERSAL_CONFLICT', 'Reverse allocations or repayments before reversing this advance');
       const reversalShift = await requireShift(advance.paymentMethod, String(advance.accountId), actor, session);
       reversed = await SupplierAdvance.findOneAndUpdate(
@@ -282,7 +286,8 @@ export async function reverseSupplierAdvance(advanceId: string, input: { idempot
   } finally { await session.endSession(); }
 }
 
-export async function reverseAdvanceAllocation(allocationId: string, input: { idempotencyKey: string; reason: string; eventAt: Date }, actor: AuthUser) {
+export async function reverseAdvanceAllocation(allocationId: string, input: ReversalInput, actor: AuthUser) {
+  requireFinancialRole(actor);
   const duplicate = await AdvanceAllocation.findOne({ reversalIdempotencyKey: input.idempotencyKey });
   if (duplicate) return duplicate;
   const session = await mongoose.startSession();
@@ -291,6 +296,7 @@ export async function reverseAdvanceAllocation(allocationId: string, input: { id
     await session.withTransaction(async () => {
       const allocation = await AdvanceAllocation.findOne({ _id: allocationId, reversedAt: { $exists: false } }).session(session);
       if (!allocation) throw new AppError(404, 'ACTIVE_ALLOCATION_NOT_FOUND', 'Active advance allocation not found');
+      await consumeReversalApproval('ADVANCE_ALLOCATION', allocationId, input, allocation.updatedAt, actor, session);
       const purchase = await Purchase.findOneAndUpdate({ _id: allocation.purchaseId, reversedAt: { $exists: false }, $expr: { $lte: [{ $add: ['$outstandingCents', allocation.amountCents] }, '$totalCents'] } }, [{ $set: { outstandingCents: { $add: ['$outstandingCents', allocation.amountCents] }, advanceAppliedCents: { $subtract: ['$advanceAppliedCents', allocation.amountCents] } } }, { $set: { paymentStatus: { $cond: [{ $eq: ['$outstandingCents', '$totalCents'] }, 'UNPAID', 'PARTIALLY_PAID'] } } }], { returnDocument: 'after', session, updatePipeline: true });
       if (!purchase) throw new AppError(409, 'ALLOCATION_REVERSAL_CONFLICT', 'Purchase balance no longer permits allocation reversal');
       const advance = await SupplierAdvance.findOneAndUpdate({ _id: allocation.advanceId, allocatedCents: { $gte: allocation.amountCents }, status: { $ne: 'REVERSED' } }, { $inc: { allocatedCents: -allocation.amountCents } }, { returnDocument: 'after', session });
@@ -306,7 +312,10 @@ export async function reverseAdvanceAllocation(allocationId: string, input: { id
 
 export async function createCompanyInvoice(input: { idempotencyKey: string; dispatchId: string; issuedAt: Date; notes?: string | undefined }, actor: AuthUser) {
   const existing = await CompanyInvoice.findOne({ $or: [{ idempotencyKey: input.idempotencyKey }, { dispatchId: input.dispatchId }] });
-  if (existing) return existing;
+  if (existing) {
+    if (String(existing.dispatchId) !== input.dispatchId) throw new AppError(409, 'IDEMPOTENCY_KEY_CONFLICT', 'Invoice key belongs to another dispatch');
+    return existing;
+  }
   const session = await mongoose.startSession();
   try {
     let invoice: any;
@@ -314,7 +323,7 @@ export async function createCompanyInvoice(input: { idempotencyKey: string; disp
       const dispatch = await DispatchBatch.findOne({ _id: input.dispatchId, status: { $in: ['RECONCILED', 'FINALIZED', 'CONFIRMED'] }, revenueCents: { $gte: 0 }, acceptedKgMilli: { $gte: 0 }, sellingRateCentsPerKg: { $gte: 0 }, reconciledAt: { $exists: true } }).session(session);
       if (!dispatch) throw new AppError(409, 'DISPATCH_NOT_INVOICEABLE', 'Dispatch requires confirmed company quantity and rate');
       const sequence = await nextCounter('company-invoice', session);
-      [invoice] = await CompanyInvoice.create([{ invoiceNumber: `INV-${String(sequence).padStart(6, '0')}`, ...input, buyerId: dispatch.buyerId, totalCents: dispatch.revenueCents, outstandingCents: dispatch.revenueCents, status: dispatch.revenueCents === 0 ? 'PAID' : 'UNPAID', createdBy: actor.id }], { session });
+      [invoice] = await CompanyInvoice.create([{ invoiceNumber: `INV-${String(sequence).padStart(6, '0')}`, ...input, buyerId: dispatch.buyerId, originalTotalCents: dispatch.revenueCents, totalCents: dispatch.revenueCents, outstandingCents: dispatch.revenueCents, status: dispatch.revenueCents === 0 ? 'PAID' : 'UNPAID', createdBy: actor.id }], { session });
       if (dispatch.status !== 'FINALIZED') await DispatchBatch.updateOne({ _id: dispatch._id, status: dispatch.status }, { $set: { status: 'FINALIZED' } }, { session });
       await BuyerLedgerEntry.create([{ buyerId: dispatch.buyerId, eventAt: input.issuedAt, type: 'SALE_RECEIVABLE', receivableDeltaCents: dispatch.revenueCents, referenceType: 'CompanyInvoice', referenceId: invoice._id, description: input.notes, createdBy: actor.id }], { session });
       await AuditLog.create([{ actorId: actor.id, action: 'COMPANY_INVOICE_CREATED', entityType: 'CompanyInvoice', entityId: invoice._id, reason: input.notes ?? 'Dispatch sale invoiced', after: { dispatchId: input.dispatchId, invoiceNumber: invoice.invoiceNumber, totalCents: invoice.totalCents } }], { session });
@@ -323,7 +332,10 @@ export async function createCompanyInvoice(input: { idempotencyKey: string; disp
   } catch (error) {
     if ((error as { code?: number }).code === 11000) {
       const duplicate = await CompanyInvoice.findOne({ $or: [{ idempotencyKey: input.idempotencyKey }, { dispatchId: input.dispatchId }] });
-      if (duplicate) return duplicate;
+      if (duplicate) {
+        if (String(duplicate.dispatchId) !== input.dispatchId) throw new AppError(409, 'IDEMPOTENCY_KEY_CONFLICT', 'Invoice key belongs to another dispatch');
+        return duplicate;
+      }
     }
     throw error;
   } finally { await session.endSession(); }
@@ -356,7 +368,8 @@ export async function postCompanySettlement(input: { idempotencyKey: string; inv
   } finally { await session.endSession(); }
 }
 
-export async function reverseCompanySettlement(settlementId: string, input: { idempotencyKey: string; reason: string; eventAt: Date }, actor: AuthUser) {
+export async function reverseCompanySettlement(settlementId: string, input: ReversalInput, actor: AuthUser) {
+  requireFinancialRole(actor);
   const duplicate = await CompanySettlement.findOne({ reversalIdempotencyKey: input.idempotencyKey });
   if (duplicate) return duplicate;
   const session = await mongoose.startSession();
@@ -365,9 +378,16 @@ export async function reverseCompanySettlement(settlementId: string, input: { id
     await session.withTransaction(async () => {
       const settlement = await CompanySettlement.findOne({ _id: settlementId, status: 'POSTED' }).session(session);
       if (!settlement) throw new AppError(404, 'POSTED_SETTLEMENT_NOT_FOUND', 'Posted company settlement not found');
+      await consumeReversalApproval('COMPANY_SETTLEMENT', settlementId, input, settlement.updatedAt, actor, session);
       const reversalShift = await requireShift(settlement.paymentMethod, String(settlement.accountId), actor, session);
-      const invoice = await CompanyInvoice.findOneAndUpdate({ _id: settlement.invoiceId, $expr: { $lte: [{ $add: ['$outstandingCents', settlement.amountCents] }, '$totalCents'] } }, [{ $set: { outstandingCents: { $add: ['$outstandingCents', settlement.amountCents] } } }, { $set: { status: { $cond: [{ $eq: ['$outstandingCents', '$totalCents'] }, 'UNPAID', 'PARTIALLY_PAID'] } } }], { returnDocument: 'after', session, updatePipeline: true });
-      if (!invoice) throw new AppError(409, 'SETTLEMENT_REVERSAL_CONFLICT', 'Invoice balance no longer permits this reversal');
+      const currentInvoice = await CompanyInvoice.findById(settlement.invoiceId).session(session);
+      if (!currentInvoice) throw new AppError(409, 'SETTLEMENT_REVERSAL_CONFLICT', 'Invoice not found');
+      const netReceivable = currentInvoice.outstandingCents - (currentInvoice.refundDueCents ?? 0) + settlement.amountCents;
+      const outstandingCents = Math.max(netReceivable, 0);
+      const refundDueCents = Math.max(-netReceivable, 0);
+      if (outstandingCents > currentInvoice.totalCents) throw new AppError(409, 'SETTLEMENT_REVERSAL_CONFLICT', 'Refunded cash must be recovered before reversing this receipt');
+      const invoice = await CompanyInvoice.findOneAndUpdate({ _id: currentInvoice._id, outstandingCents: currentInvoice.outstandingCents, refundDueCents: currentInvoice.refundDueCents === undefined ? { $exists: false } : currentInvoice.refundDueCents }, { $set: { outstandingCents, refundDueCents, status: refundDueCents > 0 ? 'REFUND_DUE' : outstandingCents === currentInvoice.totalCents ? 'UNPAID' : outstandingCents === 0 ? 'PAID' : 'PARTIALLY_PAID' } }, { returnDocument: 'after', session });
+      if (!invoice) throw new AppError(409, 'SETTLEMENT_REVERSAL_CONFLICT', 'Invoice balance changed during reversal');
       reversed = await CompanySettlement.findOneAndUpdate({ _id: settlementId, status: 'POSTED' }, { $set: { status: 'REVERSED', reversedAt: input.eventAt, reversedBy: actor.id, reversalReason: input.reason, reversalIdempotencyKey: input.idempotencyKey } }, { returnDocument: 'after', session });
       if (!reversed) throw new AppError(409, 'SETTLEMENT_REVERSAL_CONFLICT', 'Settlement was already reversed');
       await BuyerLedgerEntry.create([{ buyerId: settlement.buyerId, eventAt: input.eventAt, type: 'PAYMENT_REVERSAL', receivableDeltaCents: settlement.amountCents, referenceType: 'CompanySettlement', referenceId: settlement._id, description: input.reason, createdBy: actor.id }], { session });

@@ -5,14 +5,17 @@ import { z } from 'zod';
 import { config } from './config.js';
 import { allow, AppError, auth } from './http.js';
 import {
-  AdvanceAllocation, AdvanceRepayment, AuditLog, BuyerCompany, BuyerLedgerEntry, CashBankTransaction, CashBankTransfer, CashierShift,
-  CompanyInvoice, CompanyInvoiceAdjustment, CompanySettlement, DensityFactorVersion, DispatchBatch, DispatchReconciliation, Expense, Purchase, PurchaseCorrection, PurchaseRate, Supplier,
+  AdvanceAllocation, AdvanceRepayment, ApprovalRequest, AuditLog, BuyerCompany, BuyerLedgerEntry, CashBankTransaction, CashBankTransfer, CashierShift,
+  CompanyInvoice, CompanyInvoiceAdjustment, CompanyRefund, CompanySettlement, DensityFactorVersion, DispatchBatch, DispatchFinancialAdjustment, DispatchReconciliation, Expense, Purchase, PurchaseCorrection, PurchaseRate, Supplier,
   SupplierAdvance, SupplierLedgerEntry, SupplierPayment, User,
 } from './models.js';
 import { createPurchase } from './services/purchase-service.js';
-import { confirmDispatch, confirmDispatchDraft, createDispatchDraft, previewDispatch, reconcileDispatch } from './services/dispatch-service.js';
-import { payExpense, postDispatchAdjustment, postExpense, postTransfer, reverseDispatchAdjustment, reverseExpense, reverseTransfer } from './services/phase-b-financial-service.js';
-import { correctPurchase } from './services/purchase-correction-service.js';
+import { confirmDispatch, confirmDispatchDraft, createDispatchDraft, previewDispatch, reconcileDispatch, reconciliationApprovalPayload } from './services/dispatch-service.js';
+import { dispatchAdjustmentApprovalPayload, payExpense, postDispatchAdjustment, postExpense, postTransfer, reverseDispatchAdjustment, reverseExpense, reverseTransfer } from './services/phase-b-financial-service.js';
+import { correctPurchase, purchaseCorrectionApprovalPayload } from './services/purchase-correction-service.js';
+import { cancelApproval, decideApproval, requestApproval, reversalApprovalPayload, type ReversalKind } from './services/approval-service.js';
+import { postCompanyRefund } from './services/company-refund-service.js';
+import { configureBankOverdraft } from './services/overdraft-service.js';
 import {
   closeCashierShift, createCashBankAccount, createCompanyInvoice, issueSupplierAdvance, listCashBankAccountsWithBalances,
   openCashierShift, postCompanySettlement, postSupplierPayment, recordAdvanceRepayment, reverseAdvanceAllocation,
@@ -20,8 +23,22 @@ import {
 } from './services/financial-service.js';
 import { connectDatabase } from './db.js';
 
-const asyncRoute = (fn: (req: any, res: any) => Promise<unknown>) => (req: any, res: any, next: any) => Promise.resolve(fn(req, res)).catch(next);
+const asyncRoute = (fn: (req: any, res: any) => Promise<unknown>) => (req: any, res: any, next: any) =>
+  connectDatabase()
+    .catch(() => { throw new AppError(503, 'DATABASE_UNAVAILABLE', 'Database is unavailable'); })
+    .then(() => fn(req, res))
+    .catch(next);
 const router = Router();
+
+router.post('/approvals', auth, allow('ADMIN','MANAGER','ACCOUNTANT'), asyncRoute(async(req,res)=>{
+  await connectDatabase();
+  const input=z.object({idempotencyKey:z.string().uuid(),operation:z.enum(['COMPANY_REFUND','PURCHASE_CORRECTION','DISPATCH_RECONCILIATION','DISPATCH_ADJUSTMENT','REVERSAL','BANK_OVERDRAFT','BACKDATED_FINANCIAL_CHANGE']),targetId:z.string().min(1),payload:z.record(z.string(),z.unknown()),requestReason:z.string().min(5).max(500)}).parse(req.body);
+  res.status(201).json({data:await requestApproval(input,req.user!)});
+}));
+router.get('/approvals', auth, allow('ADMIN','MANAGER','ACCOUNTANT','AUDITOR'), asyncRoute(async(_req,res)=>{await connectDatabase();res.json({data:await ApprovalRequest.find().sort({requestedAt:-1}).limit(200).populate('requestedBy','name role').populate('decidedBy','name role').lean()});}));
+router.post('/approvals/:id/decision', auth, allow('ADMIN','ACCOUNTANT'), asyncRoute(async(req,res)=>{await connectDatabase();const input=z.object({approve:z.boolean(),reason:z.string().min(5).max(500)}).parse(req.body);res.json({data:await decideApproval(req.params.id,input,req.user!)});}));
+router.post('/approvals/:id/cancel', auth, allow('ADMIN','MANAGER','ACCOUNTANT'), asyncRoute(async(req,res)=>{await connectDatabase();const input=z.object({reason:z.string().min(5).max(500)}).parse(req.body);res.json({data:await cancelApproval(req.params.id,input.reason,req.user!)});}));
+router.get('/approvals/:id', auth, allow('ADMIN','MANAGER','ACCOUNTANT','AUDITOR'), asyncRoute(async(req,res)=>{await connectDatabase();const data=await ApprovalRequest.findById(req.params.id).populate('requestedBy','name role').populate('decidedBy','name role').lean();if(!data)throw new AppError(404,'APPROVAL_NOT_FOUND','Approval request not found');res.json({data});}));
 
 router.post('/auth/login', asyncRoute(async (req, res) => {
   await connectDatabase();
@@ -37,9 +54,26 @@ router.post('/auth/logout', (_req, res) => { res.clearCookie('access_token', { h
 router.get('/auth/me', auth, (req, res) => res.json({ user: req.user }));
 
 router.use(auth);
-router.use(async (_req, _res, next) => {
-  try { await connectDatabase(); next(); } catch { next(new AppError(503, 'DATABASE_UNAVAILABLE', 'Database is unavailable')); }
-});
+
+const reversalKinds = {
+  SUPPLIER_PAYMENT: SupplierPayment,
+  ADVANCE_REPAYMENT: AdvanceRepayment,
+  SUPPLIER_ADVANCE: SupplierAdvance,
+  ADVANCE_ALLOCATION: AdvanceAllocation,
+  COMPANY_SETTLEMENT: CompanySettlement,
+  EXPENSE: Expense,
+  CASH_TRANSFER: CashBankTransfer,
+  DISPATCH_ADJUSTMENT: DispatchFinancialAdjustment,
+} as const;
+const reversalInputSchema = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(5).max(500), eventAt: z.coerce.date() });
+router.post('/reversal-requests', allow('ADMIN','ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = reversalInputSchema.extend({ requestIdempotencyKey: z.string().uuid(), kind: z.enum(['SUPPLIER_PAYMENT','ADVANCE_REPAYMENT','SUPPLIER_ADVANCE','ADVANCE_ALLOCATION','COMPANY_SETTLEMENT','EXPENSE','CASH_TRANSFER','DISPATCH_ADJUSTMENT']), targetId: z.string().min(1) }).parse(req.body);
+  const model = reversalKinds[input.kind];
+  const source = await model.findById(input.targetId).select('updatedAt status reversedAt').lean() as { updatedAt: Date; status?: string; reversedAt?: Date } | null;
+  if (!source || source.status === 'REVERSED' || source.reversedAt) throw new AppError(404, 'ACTIVE_REVERSAL_TARGET_NOT_FOUND', 'Active financial record not found');
+  const payload = reversalApprovalPayload(input.kind, input.targetId, input, source.updatedAt);
+  res.status(201).json({ data: await requestApproval({ idempotencyKey: input.requestIdempotencyKey, operation: 'REVERSAL', targetId: input.targetId, payload, requestReason: input.reason }, req.user!) });
+}));
 
 router.get('/suppliers', asyncRoute(async (req, res) => {
   const query = String(req.query.q ?? '').trim();
@@ -97,7 +131,26 @@ router.get('/purchases/:id', asyncRoute(async (req, res) => {
   if (!data) throw new AppError(404, 'PURCHASE_NOT_FOUND', 'Purchase not found');
   res.json({ data });
 }));
-router.post('/purchases/:id/corrections',allow('ADMIN','MANAGER','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),supplierId:z.string().min(1),litresMilli:z.number().int().positive(),densityReading:z.number().int(),rateCentsPerKg:z.number().int().nonnegative(),cashPaidCents:z.number().int().nonnegative(),advanceApplications:z.array(z.object({advanceId:z.string().min(1),amountCents:z.number().int().positive()})).default([]),reason:z.string().min(5).max(500),eventAt:z.coerce.date()}).parse(req.body);res.status(201).json({data:await correctPurchase(req.params.id,{...input,approvedBy:req.user!.id},req.user!)});}));
+router.get('/purchases/:id/correction-context', allow('ADMIN','MANAGER','ACCOUNTANT','AUDITOR'), asyncRoute(async (req,res) => {
+  const purchase = await Purchase.findById(req.params.id).populate('supplierId','code name').lean();
+  if (!purchase) throw new AppError(404,'PURCHASE_NOT_FOUND','Purchase not found');
+  const [advanceApplications, cashPayment, allocatedPayment, correction] = await Promise.all([
+    AdvanceAllocation.find({purchaseId:purchase._id,reversedAt:{$exists:false}}).select('advanceId amountCents').lean(),
+    CashBankTransaction.findOne({referenceType:'Purchase',referenceId:purchase._id,type:'PURCHASE_CASH_PAYMENT'}).select('accountId signedAmountCents').lean(),
+    SupplierPayment.exists({status:'POSTED','allocations.purchaseId':purchase._id}),
+    PurchaseCorrection.findOne({originalPurchaseId:purchase._id}).select('correctionNumber correctionType').lean(),
+  ]);
+  res.json({data:{purchase,advanceApplications,cashAccountId:cashPayment?.accountId??null,hasAllocatedSupplierPayment:Boolean(allocatedPayment),correction}});
+}));
+const correctionSchema=z.object({idempotencyKey:z.string().uuid(),supplierId:z.string().min(1),litresMilli:z.number().int().positive(),densityReading:z.number().int(),rateCentsPerKg:z.number().int().nonnegative(),adjustmentCents:z.number().int().nonnegative().optional(),cashPaidCents:z.number().int().nonnegative(),cashAccountId:z.string().optional(),advanceApplications:z.array(z.object({advanceId:z.string().min(1),amountCents:z.number().int().positive()})).default([]),reason:z.string().min(5).max(500),eventAt:z.coerce.date()});
+router.post('/purchases/:id/correction-requests',allow('ADMIN','MANAGER','ACCOUNTANT'),asyncRoute(async(req,res)=>{
+  const input=correctionSchema.extend({requestIdempotencyKey:z.string().uuid()}).parse(req.body);
+  const purchase=await Purchase.findOne({_id:req.params.id,reversedAt:{$exists:false}}).select('updatedAt');
+  if(!purchase)throw new AppError(404,'ACTIVE_PURCHASE_NOT_FOUND','Active purchase not found');
+  const payload=purchaseCorrectionApprovalPayload(req.params.id,input,purchase.updatedAt);
+  res.status(201).json({data:await requestApproval({idempotencyKey:input.requestIdempotencyKey,operation:'PURCHASE_CORRECTION',targetId:req.params.id,payload,requestReason:input.reason},req.user!)});
+}));
+router.post('/purchases/:id/corrections',allow('ADMIN','MANAGER','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=correctionSchema.extend({approvalId:z.string().min(1)}).parse(req.body);res.status(201).json({data:await correctPurchase(req.params.id,input,req.user!)});}));
 router.get('/purchase-corrections',allow('ADMIN','MANAGER','ACCOUNTANT','AUDITOR'),asyncRoute(async(_req,res)=>res.json({data:await PurchaseCorrection.find().sort({createdAt:-1}).populate('originalPurchaseId','billNumber').populate('replacementPurchaseId','billNumber').lean()})));
 
 router.get('/advances/available/:supplierId', asyncRoute(async (req, res) => {
@@ -128,16 +181,16 @@ router.post('/advances/:id/repayments', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'),
 router.get('/advance-repayments', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (_req, res) => {
   res.json({ data: await AdvanceRepayment.find().sort({ eventAt: -1 }).limit(200).populate('supplierId', 'code name').populate('accountId', 'code name type').lean() });
 }));
-router.post('/advance-repayments/:id/reverse', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
-  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(3).max(500), eventAt: z.coerce.date() }).parse(req.body);
+router.post('/advance-repayments/:id/reverse', allow('ADMIN', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(5).max(500), eventAt: z.coerce.date(), approvalId: z.string().min(1) }).parse(req.body);
   res.json({ data: await reverseAdvanceRepayment(req.params.id, input, req.user!) });
 }));
-router.post('/advances/:id/reverse', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
-  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(3).max(500), eventAt: z.coerce.date() }).parse(req.body);
+router.post('/advances/:id/reverse', allow('ADMIN', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(5).max(500), eventAt: z.coerce.date(), approvalId: z.string().min(1) }).parse(req.body);
   res.json({ data: await reverseSupplierAdvance(req.params.id, input, req.user!) });
 }));
-router.post('/advance-allocations/:id/reverse', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
-  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(3).max(500), eventAt: z.coerce.date() }).parse(req.body);
+router.post('/advance-allocations/:id/reverse', allow('ADMIN', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(5).max(500), eventAt: z.coerce.date(), approvalId: z.string().min(1) }).parse(req.body);
   res.json({ data: await reverseAdvanceAllocation(req.params.id, input, req.user!) });
 }));
 
@@ -152,8 +205,8 @@ router.get('/supplier-payments', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITO
   const filter = req.query.supplierId ? { supplierId: String(req.query.supplierId) } : {};
   res.json({ data: await SupplierPayment.find(filter).sort({ eventAt: -1 }).populate('supplierId', 'code name').populate('accountId', 'code name type').lean() });
 }));
-router.post('/supplier-payments/:id/reverse', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
-  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(3).max(500), eventAt: z.coerce.date() }).parse(req.body);
+router.post('/supplier-payments/:id/reverse', allow('ADMIN', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(5).max(500), eventAt: z.coerce.date(), approvalId: z.string().min(1) }).parse(req.body);
   res.json({ data: await reverseSupplierPayment(req.params.id, input, req.user!) });
 }));
 
@@ -162,6 +215,10 @@ router.post('/cash-accounts', allow('ADMIN', 'ACCOUNTANT'), asyncRoute(async (re
   res.status(201).json({ data: await createCashBankAccount(input, req.user!) });
 }));
 router.get('/cash-accounts', allow('ADMIN', 'MANAGER', 'CASHIER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (_req, res) => res.json({ data: await listCashBankAccountsWithBalances() })));
+router.post('/cash-accounts/:id/overdraft', allow('ADMIN', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ limitCents: z.number().int().nonnegative(), reason: z.string().min(5).max(500), approvalId: z.string().min(1) }).parse(req.body);
+  res.json({ data: await configureBankOverdraft({ ...input, accountId: req.params.id }, req.user!) });
+}));
 router.get('/cash-transactions', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
   const page = Math.max(1, Number(req.query.page ?? 1));
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 50)));
@@ -198,13 +255,23 @@ router.post('/dispatches/drafts', allow('ADMIN', 'MANAGER'), asyncRoute(async (r
 router.post('/dispatches/:id/confirm', allow('ADMIN','MANAGER'), asyncRoute(async(req,res)=>{
   const input=z.object({idempotencyKey:z.string().uuid()}).parse(req.body);res.json({data:await confirmDispatchDraft(req.params.id,input.idempotencyKey,req.user!)});
 }));
-router.post('/dispatches/:id/reconcile', allow('ADMIN','MANAGER','ACCOUNTANT'), asyncRoute(async(req,res)=>{
-  const input=z.object({idempotencyKey:z.string().uuid(),eventAt:z.coerce.date(),acceptedKgMilli:z.number().int().nonnegative(),sellingRateCentsPerKg:z.number().int().nonnegative(),weighbridgeReference:z.string().min(1).max(100),weighbridgeDocumentName:z.string().max(200).optional(),weighbridgeDocumentUrl:z.string().url().max(1000).optional(),discrepancyReason:z.string().max(500).optional(),notes:z.string().max(500).optional()}).parse(req.body);
-  res.json({data:await reconcileDispatch({...input,dispatchId:req.params.id,approvedBy:req.user!.id},req.user!)});
+const reconciliationSchema=z.object({idempotencyKey:z.string().uuid(),eventAt:z.coerce.date(),acceptedKgMilli:z.number().int().nonnegative(),sellingRateCentsPerKg:z.number().int().nonnegative(),weighbridgeReference:z.string().min(1).max(100),weighbridgeDocumentName:z.string().max(200).optional(),weighbridgeDocumentUrl:z.string().url().max(1000).optional(),discrepancyReason:z.string().max(500).optional(),notes:z.string().max(500).optional()});
+router.post('/dispatches/:id/reconciliation-requests',allow('ADMIN','MANAGER','ACCOUNTANT'),asyncRoute(async(req,res)=>{
+  const input=reconciliationSchema.extend({requestIdempotencyKey:z.string().uuid()}).parse(req.body);
+  const dispatch=await DispatchBatch.findOne({_id:req.params.id,status:{$in:['CONFIRMED','RECONCILED','FINALIZED']}}).select('updatedAt');
+  if(!dispatch)throw new AppError(404,'DISPATCH_NOT_RECONCILABLE','Confirmed dispatch not found');
+  const payload=reconciliationApprovalPayload({...input,dispatchId:req.params.id},dispatch.updatedAt);
+  res.status(201).json({data:await requestApproval({idempotencyKey:input.requestIdempotencyKey,operation:'DISPATCH_RECONCILIATION',targetId:req.params.id,payload,requestReason:input.discrepancyReason??'Company weighbridge reconciliation'},req.user!)});
 }));
-router.get('/dispatches/:id', asyncRoute(async(req,res)=>{const data=await DispatchBatch.findById(req.params.id).populate('buyerId','name settlementTerms').lean();if(!data)throw new AppError(404,'DISPATCH_NOT_FOUND','Dispatch not found');const [purchases,reconciliations,expenses,invoice,adjustments]=await Promise.all([Purchase.find({dispatchId:data._id}).sort({sequence:1}).populate('supplierId','code name').lean(),DispatchReconciliation.find({dispatchId:data._id}).sort({version:-1}).lean(),Expense.find({dispatchId:data._id}).sort({expenseAt:-1}).lean(),CompanyInvoice.findOne({dispatchId:data._id}).lean(),CompanyInvoiceAdjustment.find({dispatchId:data._id}).sort({eventAt:-1}).lean()]);res.json({data:{dispatch:data,purchases,reconciliations,expenses,invoice,invoiceAdjustments:adjustments}});}));
-router.post('/dispatches/:id/adjustments',allow('ADMIN','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),amountCents:z.number().int().refine(v=>v!==0),eventAt:z.coerce.date(),reason:z.string().min(3).max(500)}).parse(req.body);res.status(201).json({data:await postDispatchAdjustment({...input,dispatchId:req.params.id},req.user!)});}));
-router.post('/dispatch-adjustments/:id/reverse',allow('ADMIN','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),eventAt:z.coerce.date(),reason:z.string().min(3).max(500)}).parse(req.body);res.json({data:await reverseDispatchAdjustment(req.params.id,input,req.user!)});}));
+router.post('/dispatches/:id/reconcile', allow('ADMIN','MANAGER','ACCOUNTANT'), asyncRoute(async(req,res)=>{
+  const input=reconciliationSchema.extend({approvalId:z.string().min(1)}).parse(req.body);
+  res.json({data:await reconcileDispatch({...input,dispatchId:req.params.id},req.user!)});
+}));
+router.get('/dispatches/:id', asyncRoute(async(req,res)=>{const data=await DispatchBatch.findById(req.params.id).populate('buyerId','name settlementTerms').lean();if(!data)throw new AppError(404,'DISPATCH_NOT_FOUND','Dispatch not found');const [purchases,reconciliations,expenses,invoice,invoiceAdjustments,financialAdjustments]=await Promise.all([Purchase.find({dispatchId:data._id}).sort({sequence:1}).populate('supplierId','code name').lean(),DispatchReconciliation.find({dispatchId:data._id}).sort({version:-1}).lean(),Expense.find({dispatchId:data._id}).sort({expenseAt:-1}).lean(),CompanyInvoice.findOne({dispatchId:data._id}).lean(),CompanyInvoiceAdjustment.find({dispatchId:data._id}).sort({eventAt:-1}).lean(),DispatchFinancialAdjustment.find({dispatchId:data._id}).sort({eventAt:-1}).lean()]);res.json({data:{dispatch:data,purchases,reconciliations,expenses,invoice,invoiceAdjustments,financialAdjustments}});}));
+const dispatchAdjustmentSchema=z.object({idempotencyKey:z.string().uuid(),amountCents:z.number().int().refine(v=>v!==0),eventAt:z.coerce.date(),reason:z.string().min(5).max(500)});
+router.post('/dispatches/:id/adjustment-requests',allow('ADMIN','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=dispatchAdjustmentSchema.extend({requestIdempotencyKey:z.string().uuid()}).parse(req.body);const dispatch=await DispatchBatch.findOne({_id:req.params.id,status:{$in:['RECONCILED','FINALIZED']}}).select('updatedAt');if(!dispatch)throw new AppError(404,'RECONCILED_DISPATCH_NOT_FOUND','Reconciled dispatch not found');const payload=dispatchAdjustmentApprovalPayload({...input,dispatchId:req.params.id},dispatch.updatedAt);res.status(201).json({data:await requestApproval({idempotencyKey:input.requestIdempotencyKey,operation:'DISPATCH_ADJUSTMENT',targetId:req.params.id,payload,requestReason:input.reason},req.user!)});}));
+router.post('/dispatches/:id/adjustments',allow('ADMIN','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=dispatchAdjustmentSchema.extend({approvalId:z.string().min(1)}).parse(req.body);res.status(201).json({data:await postDispatchAdjustment({...input,dispatchId:req.params.id},req.user!)});}));
+router.post('/dispatch-adjustments/:id/reverse',allow('ADMIN','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),eventAt:z.coerce.date(),reason:z.string().min(5).max(500),approvalId:z.string().min(1)}).parse(req.body);res.json({data:await reverseDispatchAdjustment(req.params.id,input,req.user!)});}));
 router.post('/dispatches/confirm', allow('ADMIN', 'MANAGER'), asyncRoute(async (req, res) => {
   const input = z.object({ idempotencyKey: z.string().uuid(), locationId: z.string().default('MAIN'), lastSequence: z.number().int().positive(), buyerId: z.string(), vehicleNumber: z.string().min(2), dispatchedAt: z.coerce.date(), acceptedKgMilli: z.number().int().nonnegative().optional(), sellingRateCentsPerKg: z.number().int().nonnegative().optional(), directExpenseCents: z.number().int().nonnegative().default(0) }).parse(req.body);
   res.status(201).json({ data: await confirmDispatch(input, req.user) });
@@ -213,11 +280,11 @@ router.get('/dispatches', asyncRoute(async (_req, res) => res.json({ data: await
 
 router.post('/expenses',allow('ADMIN','MANAGER','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),category:z.string().min(2).max(100),description:z.string().min(2).max(500),amountCents:z.number().int().positive(),allocationType:z.enum(['DIRECT_DISPATCH','GENERAL']),dispatchId:z.string().optional(),expenseAt:z.coerce.date(),paymentStatus:z.enum(['UNPAID','PAID']),paymentMethod:z.enum(['CASH','BANK']).optional(),accountId:z.string().optional(),referenceNumber:z.string().max(100).optional()}).parse(req.body);res.status(201).json({data:await postExpense(input,req.user!)});}));
 router.get('/expenses',allow('ADMIN','MANAGER','ACCOUNTANT','AUDITOR'),asyncRoute(async(req,res)=>{const filter=req.query.dispatchId?{dispatchId:String(req.query.dispatchId)}:{};res.json({data:await Expense.find(filter).sort({expenseAt:-1}).populate('dispatchId','dispatchNumber').populate('accountId','code name').lean()});}));
-router.post('/expenses/:id/reverse',allow('ADMIN','MANAGER','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),eventAt:z.coerce.date(),reason:z.string().min(3).max(500)}).parse(req.body);res.json({data:await reverseExpense(req.params.id,input,req.user!)});}));
+router.post('/expenses/:id/reverse',allow('ADMIN','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),eventAt:z.coerce.date(),reason:z.string().min(5).max(500),approvalId:z.string().min(1)}).parse(req.body);res.json({data:await reverseExpense(req.params.id,input,req.user!)});}));
 router.post('/expenses/:id/pay',allow('ADMIN','MANAGER','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),eventAt:z.coerce.date(),paymentMethod:z.enum(['CASH','BANK']),accountId:z.string().min(1),referenceNumber:z.string().max(100).optional()}).parse(req.body);res.json({data:await payExpense(req.params.id,input,req.user!)});}));
 router.post('/cash-transfers',allow('ADMIN','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),sourceAccountId:z.string().min(1),destinationAccountId:z.string().min(1),amountCents:z.number().int().positive(),eventAt:z.coerce.date(),referenceNumber:z.string().min(1).max(100),description:z.string().max(500).optional()}).parse(req.body);res.status(201).json({data:await postTransfer(input,req.user!)});}));
 router.get('/cash-transfers',allow('ADMIN','MANAGER','ACCOUNTANT','AUDITOR'),asyncRoute(async(_req,res)=>res.json({data:await CashBankTransfer.find().sort({eventAt:-1}).populate('sourceAccountId','code name type').populate('destinationAccountId','code name type').lean()})));
-router.post('/cash-transfers/:id/reverse',allow('ADMIN','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),eventAt:z.coerce.date(),reason:z.string().min(3).max(500)}).parse(req.body);res.json({data:await reverseTransfer(req.params.id,input,req.user!)});}));
+router.post('/cash-transfers/:id/reverse',allow('ADMIN','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),eventAt:z.coerce.date(),reason:z.string().min(5).max(500),approvalId:z.string().min(1)}).parse(req.body);res.json({data:await reverseTransfer(req.params.id,input,req.user!)});}));
 router.get('/buyers', asyncRoute(async (_req, res) => res.json({ data: await BuyerCompany.find({ active: true }).sort({ name: 1 }).lean() })));
 router.get('/buyers/:id/statement', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
   const entries = await BuyerLedgerEntry.find({ buyerId: req.params.id }).sort({ eventAt: 1, _id: 1 }).lean();
@@ -231,7 +298,7 @@ router.post('/company-invoices', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncR
 router.get('/company-invoices', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
   const filter: Record<string, unknown> = {};
   if (req.query.buyerId) filter.buyerId = String(req.query.buyerId);
-  if (req.query.status) filter.status = z.enum(['UNPAID', 'PARTIALLY_PAID', 'PAID']).parse(req.query.status);
+  if (req.query.status) filter.status = z.enum(['UNPAID', 'PARTIALLY_PAID', 'PAID', 'REFUND_DUE']).parse(req.query.status);
   res.json({ data: await CompanyInvoice.find(filter).sort({ issuedAt: -1 }).populate('buyerId', 'name').populate('dispatchId', 'dispatchNumber vehicleNumber acceptedKgMilli').lean() });
 }));
 router.post('/company-settlements', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
@@ -242,9 +309,57 @@ router.get('/company-settlements', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDI
   const filter = req.query.buyerId ? { buyerId: String(req.query.buyerId) } : {};
   res.json({ data: await CompanySettlement.find(filter).sort({ eventAt: -1 }).populate('buyerId', 'name').populate('invoiceId', 'invoiceNumber').populate('accountId', 'code name type').lean() });
 }));
-router.post('/company-settlements/:id/reverse', allow('ADMIN', 'MANAGER', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
-  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(3).max(500), eventAt: z.coerce.date() }).parse(req.body);
+router.post('/company-settlements/:id/reverse', allow('ADMIN', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), reason: z.string().min(5).max(500), eventAt: z.coerce.date(), approvalId: z.string().min(1) }).parse(req.body);
   res.json({ data: await reverseCompanySettlement(req.params.id, input, req.user!) });
+}));
+router.post('/company-refunds', allow('ADMIN', 'ACCOUNTANT'), asyncRoute(async (req, res) => {
+  const input = z.object({ idempotencyKey: z.string().uuid(), invoiceId: z.string().min(1), amountCents: z.number().int().positive(), accountId: z.string().min(1), paymentMethod: z.enum(['CASH', 'BANK']), eventAt: z.coerce.date(), reason: z.string().min(5).max(500), approvalId: z.string().min(1) }).parse(req.body);
+  res.status(201).json({ data: await postCompanyRefund(input, req.user!) });
+}));
+router.post('/approvals/:id/execute', allow('ADMIN','MANAGER','ACCOUNTANT'), asyncRoute(async(req,res)=>{
+  const request=await ApprovalRequest.findById(req.params.id).lean();
+  if(!request)throw new AppError(404,'APPROVAL_NOT_FOUND','Approval request not found');
+  if(!['APPROVED','EXECUTED'].includes(request.status))throw new AppError(409,'APPROVAL_NOT_APPROVED','Approval is not executable');
+  const payload=request.payload as Record<string,unknown>;
+  if(request.operation==='PURCHASE_CORRECTION'){
+    const input=correctionSchema.extend({approvalId:z.string()}).parse({...payload,adjustmentCents:payload.adjustmentCents??undefined,cashAccountId:payload.cashAccountId??undefined,approvalId:req.params.id});
+    return res.json({data:await correctPurchase(String(request.targetId),input,req.user!)});
+  }
+  if(request.operation==='DISPATCH_RECONCILIATION'){
+    const input=reconciliationSchema.extend({approvalId:z.string()}).parse({...payload,weighbridgeDocumentName:payload.weighbridgeDocumentName??undefined,weighbridgeDocumentUrl:payload.weighbridgeDocumentUrl??undefined,discrepancyReason:payload.discrepancyReason??undefined,notes:payload.notes??undefined,approvalId:req.params.id});
+    return res.json({data:await reconcileDispatch({...input,dispatchId:String(request.targetId)},req.user!)});
+  }
+  if(request.operation==='COMPANY_REFUND'){
+    if(req.user!.role==='MANAGER')throw new AppError(403,'FORBIDDEN','Only an administrator or accountant can execute a company refund');
+    const input=z.object({invoiceId:z.string(),amountCents:z.number().int().positive(),accountId:z.string(),paymentMethod:z.enum(['CASH','BANK']),eventAt:z.coerce.date(),reason:z.string()}).parse(payload);
+    return res.json({data:await postCompanyRefund({...input,idempotencyKey:request.idempotencyKey,approvalId:req.params.id},req.user!)});
+  }
+  if(request.operation==='DISPATCH_ADJUSTMENT'){
+    if(req.user!.role==='MANAGER')throw new AppError(403,'FORBIDDEN','Only an administrator or accountant can execute a profit adjustment');
+    const input=dispatchAdjustmentSchema.extend({approvalId:z.string()}).parse({...payload,approvalId:req.params.id});
+    return res.json({data:await postDispatchAdjustment({...input,dispatchId:String(request.targetId)},req.user!)});
+  }
+  if(request.operation==='REVERSAL'){
+    if(req.user!.role==='MANAGER')throw new AppError(403,'FORBIDDEN','Only an administrator or accountant can execute a reversal');
+    const input=reversalInputSchema.extend({approvalId:z.string()}).parse({...payload,approvalId:req.params.id});
+    const targetId=String(request.targetId);
+    const kind=payload.kind as ReversalKind;
+    const handlers={SUPPLIER_PAYMENT:reverseSupplierPayment,ADVANCE_REPAYMENT:reverseAdvanceRepayment,SUPPLIER_ADVANCE:reverseSupplierAdvance,ADVANCE_ALLOCATION:reverseAdvanceAllocation,COMPANY_SETTLEMENT:reverseCompanySettlement,EXPENSE:reverseExpense,CASH_TRANSFER:reverseTransfer,DISPATCH_ADJUSTMENT:reverseDispatchAdjustment};
+    const handler=handlers[kind];
+    if(!handler)throw new AppError(422,'REVERSAL_KIND_INVALID','Unsupported reversal target');
+    return res.json({data:await handler(targetId,input,req.user!)});
+  }
+  throw new AppError(422,'EXECUTION_NOT_SUPPORTED','This approval type must be executed through its dedicated API');
+}));
+router.get('/company-refunds', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
+  const filter = req.query.buyerId ? { buyerId: String(req.query.buyerId) } : {};
+  res.json({ data: await CompanyRefund.find(filter).sort({ eventAt: -1 }).populate('buyerId', 'name').populate('invoiceId', 'invoiceNumber').populate('accountId', 'code name type').lean() });
+}));
+router.get('/audit',allow('ADMIN','ACCOUNTANT','AUDITOR'),asyncRoute(async(req,res)=>{
+  const limit=z.coerce.number().int().min(1).max(200).default(100).parse(req.query.limit);
+  const filter=req.query.entityType?{entityType:String(req.query.entityType)}:{};
+  res.json({data:await AuditLog.find(filter).sort({createdAt:-1,_id:-1}).limit(limit).populate('actorId','name role').lean()});
 }));
 
 router.get('/dashboard', asyncRoute(async (_req, res) => {

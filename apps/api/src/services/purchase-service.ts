@@ -1,7 +1,8 @@
 import mongoose, { type ClientSession } from 'mongoose';
 import { calculatePurchase, calculateSettlement } from '@latex/domain';
 import { AppError, type AuthUser } from '../http.js';
-import { AdvanceAllocation, AuditLog, CashBankTransaction, CashierShift, Counter, DensityFactorVersion, Purchase, PurchaseRate, Supplier, SupplierAdvance, SupplierLedgerEntry } from '../models.js';
+import { AdvanceAllocation, AuditLog, CashierShift, Counter, DensityFactorVersion, Purchase, PurchaseRate, Supplier, SupplierAdvance, SupplierLedgerEntry } from '../models.js';
+import { postCashBankMovement } from './cash-bank-policy.js';
 
 export interface CreatePurchaseInput {
   idempotencyKey: string; locationId: string; supplierId: string; eventAt: Date; litresMilli: number; densityReading: number;
@@ -49,7 +50,7 @@ export async function createPurchase(input: CreatePurchaseInput, actor: AuthUser
         const shift = await CashierShift.findOne({ cashierId: actor.id, status: 'OPEN' }).session(session);
         if (!shift) throw new AppError(409, 'SHIFT_REQUIRED', 'Open a cashier shift before paying cash for a purchase');
         await SupplierLedgerEntry.create([{ supplierId: input.supplierId, eventAt: input.eventAt, type: 'PAYMENT', payableDeltaCents: -input.cashPaidCents, advanceDeltaCents: 0, referenceType: 'Purchase', referenceId: result._id, createdBy: actor.id }], { session });
-        await CashBankTransaction.create([{ idempotencyKey: `${input.idempotencyKey}:cash`, accountId: shift.accountId, shiftId: shift._id, eventAt: input.eventAt, type: 'PURCHASE_CASH_PAYMENT', signedAmountCents: -input.cashPaidCents, referenceType: 'Purchase', referenceId: result._id, description: `Cash settlement for ${result.billNumber}`, createdBy: actor.id }], { session });
+        await postCashBankMovement({ idempotencyKey: `${input.idempotencyKey}:cash`, accountId: shift.accountId, shiftId: shift._id, eventAt: input.eventAt, type: 'PURCHASE_CASH_PAYMENT', signedAmountCents: -input.cashPaidCents, referenceType: 'Purchase', referenceId: result._id, description: `Cash settlement for ${result.billNumber}`, actorId: actor.id }, session);
       }
       for (const allocation of input.advanceApplications) {
         const updated = await SupplierAdvance.findOneAndUpdate({ _id: allocation.advanceId, supplierId: input.supplierId, status: { $ne: 'REVERSED' }, $expr: { $gte: [{ $subtract: ['$issuedCents', { $add: ['$allocatedCents', '$repaidCents'] }] }, allocation.amountCents] } }, { $inc: { allocatedCents: allocation.amountCents } }, { returnDocument: 'after', session });

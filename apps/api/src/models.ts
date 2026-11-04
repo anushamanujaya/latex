@@ -54,9 +54,11 @@ const purchaseSchema = new Schema({
   kgMilli: { type: Number, required: true },
   rateCentsPerKg: { type: Number, required: true },
   rateSourceId: { type: objectId, ref: 'PurchaseRate', required: true },
+  rateSourceType: { type: String, enum: ['SCHEDULED', 'CORRECTION'], default: 'SCHEDULED' },
   subtotalCents: { type: Number, required: true },
   adjustmentCents: { type: Number, required: true, default: 0 },
   totalCents: { type: Number, required: true },
+  correctionDeltaCents: { type: Number, default: 0 },
   cashPaidCents: { type: Number, required: true, default: 0 },
   advanceAppliedCents: { type: Number, required: true, default: 0 },
   outstandingCents: { type: Number, required: true },
@@ -144,6 +146,11 @@ const cashBankAccountSchema = new Schema({
   name: { type: String, required: true, trim: true },
   type: { type: String, enum: ['CASH', 'BANK'], required: true, index: true },
   openingBalanceCents: { type: Number, required: true, default: 0 },
+  ledgerVersion: { type: Number, required: true, default: 0 },
+  overdraftLimitCents: { type: Number, required: true, default: 0, min: 0 },
+  overdraftApprovedBy: { type: objectId, ref: 'User' },
+  overdraftApprovedAt: Date,
+  overdraftReason: String,
   active: { type: Boolean, default: true, index: true },
   createdBy: { type: objectId, ref: 'User', required: true },
 }, timestamps);
@@ -153,7 +160,7 @@ const cashBankTransactionSchema = new Schema({
   accountId: { type: objectId, ref: 'CashBankAccount', required: true, index: true },
   shiftId: { type: objectId, ref: 'CashierShift', index: true },
   eventAt: { type: Date, required: true, index: true },
-  type: { type: String, enum: ['SUPPLIER_PAYMENT', 'PURCHASE_CASH_PAYMENT', 'ADVANCE_ISSUE', 'ADVANCE_REPAYMENT', 'COMPANY_RECEIPT', 'EXPENSE', 'OPENING_ADJUSTMENT', 'REVERSAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'SHIFT_VARIANCE'], required: true, index: true },
+  type: { type: String, enum: ['SUPPLIER_PAYMENT', 'PURCHASE_CASH_PAYMENT', 'ADVANCE_ISSUE', 'ADVANCE_REPAYMENT', 'COMPANY_RECEIPT', 'COMPANY_REFUND', 'EXPENSE', 'OPENING_ADJUSTMENT', 'REVERSAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'SHIFT_VARIANCE'], required: true, index: true },
   signedAmountCents: { type: Number, required: true },
   referenceType: { type: String, required: true },
   referenceId: { type: objectId, required: true },
@@ -219,8 +226,10 @@ const companyInvoiceSchema = new Schema({
   buyerId: { type: objectId, ref: 'BuyerCompany', required: true, index: true },
   issuedAt: { type: Date, required: true, index: true },
   totalCents: { type: Number, required: true, min: 0 },
+  originalTotalCents: { type: Number, min: 0 },
   outstandingCents: { type: Number, required: true, min: 0 },
-  status: { type: String, enum: ['UNPAID', 'PARTIALLY_PAID', 'PAID'], required: true, index: true },
+  refundDueCents: { type: Number, required: true, default: 0, min: 0 },
+  status: { type: String, enum: ['UNPAID', 'PARTIALLY_PAID', 'PAID', 'REFUND_DUE'], required: true, index: true },
   createdBy: { type: objectId, ref: 'User', required: true },
   notes: String,
 }, timestamps);
@@ -258,10 +267,25 @@ const companySettlementSchema = new Schema({
   reversalIdempotencyKey: { type: String, unique: true, sparse: true },
 }, timestamps);
 
+const companyRefundSchema = new Schema({
+  refundNumber: { type: String, required: true, unique: true },
+  idempotencyKey: { type: String, required: true, unique: true },
+  invoiceId: { type: objectId, ref: 'CompanyInvoice', required: true, index: true },
+  buyerId: { type: objectId, ref: 'BuyerCompany', required: true, index: true },
+  amountCents: { type: Number, required: true, min: 1 },
+  accountId: { type: objectId, ref: 'CashBankAccount', required: true },
+  shiftId: { type: objectId, ref: 'CashierShift' },
+  paymentMethod: { type: String, enum: ['CASH', 'BANK'], required: true },
+  eventAt: { type: Date, required: true },
+  reason: { type: String, required: true },
+  approvalId: { type: objectId, ref: 'ApprovalRequest', required: true, unique: true },
+  createdBy: { type: objectId, ref: 'User', required: true },
+}, timestamps);
+
 const buyerLedgerSchema = new Schema({
   buyerId: { type: objectId, ref: 'BuyerCompany', required: true, index: true },
   eventAt: { type: Date, required: true, index: true },
-  type: { type: String, enum: ['SALE_RECEIVABLE', 'PAYMENT_RECEIVED', 'PAYMENT_REVERSAL', 'ADJUSTMENT'], required: true },
+  type: { type: String, enum: ['SALE_RECEIVABLE', 'PAYMENT_RECEIVED', 'PAYMENT_REVERSAL', 'ADJUSTMENT', 'REFUND'], required: true },
   receivableDeltaCents: { type: Number, required: true },
   referenceType: { type: String, required: true },
   referenceId: { type: objectId, required: true },
@@ -281,6 +305,7 @@ const dispatchSchema = new Schema({
   firstSequence: { type: Number, required: true },
   lastSequence: { type: Number, required: true },
   purchaseCount: { type: Number, required: true },
+  purchaseIds: [{ type: objectId, ref: 'Purchase' }],
   totalLitresMilli: { type: Number, required: true },
   acquiredKgMilli: { type: Number, required: true },
   purchaseCostCents: { type: Number, required: true },
@@ -358,10 +383,29 @@ const cashBankTransferSchema = new Schema({
 }, timestamps);
 
 const purchaseCorrectionSchema = new Schema({
-  correctionNumber: { type: String, required: true, unique: true }, idempotencyKey: { type: String, required: true, unique: true }, originalPurchaseId: { type: objectId, ref: 'Purchase', required: true, index: true },
+  correctionNumber: { type: String, required: true, unique: true }, idempotencyKey: { type: String, required: true, unique: true }, originalPurchaseId: { type: objectId, ref: 'Purchase', required: true, unique: true },
+  requestPayloadHash: String,
   replacementPurchaseId: { type: objectId, ref: 'Purchase' }, correctionType: { type: String, enum: ['VOID_REPLACE', 'DISPATCH_ADJUSTMENT'], required: true }, reason: { type: String, required: true },
   originalSnapshot: { type: Schema.Types.Mixed, required: true }, replacementSnapshot: Schema.Types.Mixed, inventoryKgDeltaMilli: { type: Number, default: 0 }, costDeltaCents: { type: Number, default: 0 },
   createdBy: { type: objectId, ref: 'User', required: true }, approvedBy: { type: objectId, ref: 'User', required: true },
+}, timestamps);
+
+const approvalRequestSchema = new Schema({
+  idempotencyKey: { type: String, required: true, unique: true },
+  operation: { type: String, enum: ['COMPANY_REFUND', 'PURCHASE_CORRECTION', 'DISPATCH_RECONCILIATION', 'DISPATCH_ADJUSTMENT', 'REVERSAL', 'BANK_OVERDRAFT', 'BACKDATED_FINANCIAL_CHANGE'], required: true, index: true },
+  targetId: { type: objectId, required: true, index: true },
+  payload: { type: Schema.Types.Mixed, required: true },
+  payloadHash: { type: String, required: true },
+  requestReason: { type: String, required: true },
+  status: { type: String, enum: ['REQUESTED', 'APPROVED', 'REJECTED', 'CANCELLED', 'EXECUTED'], required: true, default: 'REQUESTED', index: true },
+  requestedBy: { type: objectId, ref: 'User', required: true },
+  requestedAt: { type: Date, required: true, default: Date.now },
+  decidedBy: { type: objectId, ref: 'User' },
+  decidedAt: Date,
+  decisionReason: String,
+  executedBy: { type: objectId, ref: 'User' },
+  executedAt: Date,
+  executionReferenceId: { type: objectId },
 }, timestamps);
 
 const auditSchema = new Schema({
@@ -386,6 +430,7 @@ export const AdvanceRepayment: Model<any> = models.AdvanceRepayment ?? model('Ad
 export const Counter: Model<any> = models.Counter ?? model('Counter', counterSchema);
 export const BuyerCompany: Model<any> = models.BuyerCompany ?? model('BuyerCompany', buyerSchema);
 export const CompanyInvoice: Model<any> = models.CompanyInvoice ?? model('CompanyInvoice', companyInvoiceSchema);
+export const CompanyRefund: Model<any> = models.CompanyRefund ?? model('CompanyRefund', companyRefundSchema);
 export const CompanyInvoiceAdjustment: Model<any> = models.CompanyInvoiceAdjustment ?? model('CompanyInvoiceAdjustment', companyInvoiceAdjustmentSchema);
 export const CompanySettlement: Model<any> = models.CompanySettlement ?? model('CompanySettlement', companySettlementSchema);
 export const BuyerLedgerEntry: Model<any> = models.BuyerLedgerEntry ?? model('BuyerLedgerEntry', buyerLedgerSchema);
@@ -395,6 +440,7 @@ export const Expense: Model<any> = models.Expense ?? model('Expense', expenseSch
 export const DispatchFinancialAdjustment: Model<any> = models.DispatchFinancialAdjustment ?? model('DispatchFinancialAdjustment', dispatchFinancialAdjustmentSchema);
 export const CashBankTransfer: Model<any> = models.CashBankTransfer ?? model('CashBankTransfer', cashBankTransferSchema);
 export const PurchaseCorrection: Model<any> = models.PurchaseCorrection ?? model('PurchaseCorrection', purchaseCorrectionSchema);
+export const ApprovalRequest: Model<any> = models.ApprovalRequest ?? model('ApprovalRequest', approvalRequestSchema);
 export const AuditLog: Model<any> = models.AuditLog ?? model('AuditLog', auditSchema);
 
 export type UserDocument = InferSchemaType<typeof userSchema>;

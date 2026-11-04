@@ -14,6 +14,6 @@ button, input, select, textarea { font: inherit; }
 @media print {
   body * { visibility: hidden; }
   #receipt, #receipt * { visibility: visible; }
-  #receipt { position: absolute; inset: 0 auto auto 0; width: 80mm; padding: 4mm; color: #000; background: #fff; font-size: 11px; }
+  #receipt { position: absolute; inset: 0 auto auto 0; width: 80mm; max-width: 80mm; padding: 4mm; color: #000; background: #fff; font-size: 11px; font-family: 'Noto Sans Sinhala', ui-monospace, monospace; overflow-wrap: anywhere; box-shadow: none; }
   @page { size: 80mm auto; margin: 0; }
 }

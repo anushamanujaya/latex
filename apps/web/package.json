@@ -11,6 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@fontsource/noto-sans-sinhala": "^5.3.0",
     "@hookform/resolvers": "^5.2.2",
     "@latex/domain": "*",
     "@tanstack/react-query": "^5.90.5",

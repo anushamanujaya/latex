@@ -1,0 +1,18 @@
+# Phase B cross-ledger correction boundary — 2026-11-04
+
+This is an implementation audit, not a new accounting policy. Posted source records, original payments, approvals, and audit events remain historical. MongoDB transactions protect multi-document postings; acceptance still requires production-shaped staging.
+
+| Scenario | Affected records/ledgers | Current safe treatment | Status |
+|---|---|---|---|
+| Undispatched unpaid purchase, same or different supplier | Purchase, supplier payable, pending-inventory projection | Independently approved void/replacement; reverse original payable, post replacement payable, preserve both purchase records | Implemented |
+| Undispatched purchase with original cash, same supplier/account | Purchase, supplier payable, cash account and cashier shift, pending-inventory projection | Independently approved void/replacement; retain original cash movement, post only signed difference to original account and replacement payable/payment entries | Implemented; physical cash/refund must be verified by operator |
+| Undispatched purchase with allocated supplier payment | Purchase, supplier payable, cash/bank account, supplier-payment allocation | Reverse payment with separate maker/checker approval before void/replacement; do not silently reallocate paid funds | Blocked until that reversal is executed |
+| Undispatched cash-paid purchase changed to another supplier or cash account | Two supplier payables and/or two cash accounts | No automatic transfer of already-paid money | Blocked; needs signed supplier refund/transfer policy |
+| Confirmed dispatched purchase, same supplier and unchanged settlements | Supplier payable, purchased KG/cost, dispatch inventory boundary and profit | Independently approved cost/quantity delta; retain original purchase, payment, boundary, invoice revenue; recompute gross/net profit and outstanding payable | Implemented; only one correction per source |
+| Confirmed dispatched purchase changes cash, advance allocation, supplier identity, or posted supplier payment | Cash/bank, supplier/advance ledgers, inventory, profit, possibly buyer/invoice | No defined cross-ledger recovery/transfer rule; transaction rejects before posting | Blocked pending finance-owner policy |
+| Invoiced company weight/revenue correction | Dispatch profit, invoice, buyer receivable; possibly refundable buyer balance | Independently approved debit/credit adjustment; excess receipts become tracked refund due and require separately approved actual refund | Implemented within documented refund rules |
+| Company receipt reversal after refund | Buyer receivable/refund liability, cash/bank | Reject if reversal would conflict with an already-paid refund | Blocked pending actual recovery of buyer funds |
+
+No separate inventory-journal model currently exists; pending inventory is derived from active purchases, and confirmed inventory is represented by dispatch membership and metrics. No automatic historical stock write-off, tax treatment, discount taxonomy, cheque lifecycle, multi-supplier offset, or buyer re-invoicing policy should be inferred from these flows.
+
+Additional controls verified in local synthetic MongoDB tests: exact-payload independent approval, stale-source rejection, one-time execution, idempotent retry, conflicting-key rejection for new purchase corrections, transactional rollback on dispatched settlement change, and competing transfer serialization. Legacy correction rows without the new request hash retain their previous retry behavior; a staging migration/reconciliation decision is required before relying on conflict detection for those rows.

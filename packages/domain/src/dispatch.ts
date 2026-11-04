@@ -1,5 +1,14 @@
 import { cents, type MoneyCents } from './money.js';
 
+function roundedRatio(numerator: number, multiplier: number, denominator: number): number {
+  if (!Number.isSafeInteger(numerator) || !Number.isSafeInteger(multiplier) || !Number.isSafeInteger(denominator) || denominator <= 0) throw new Error('Ratio inputs must be safe integers with a positive denominator');
+  const scaled = BigInt(numerator) * BigInt(multiplier);
+  const magnitude = (scaled < 0n ? -scaled : scaled) + BigInt(denominator) / 2n;
+  const result = Number(magnitude / BigInt(denominator) * (scaled < 0n ? -1n : 1n));
+  if (!Number.isSafeInteger(result)) throw new Error('Ratio exceeds safe integer range');
+  return result;
+}
+
 export function calculateDispatchProfit(args: {
   purchaseCostCents: number;
   acceptedKgMilli: number;
@@ -7,7 +16,11 @@ export function calculateDispatchProfit(args: {
   expenseCents: number;
   adjustmentCents?: number;
 }): { revenueCents: MoneyCents; grossProfitCents: MoneyCents; netProfitCents: MoneyCents } {
-  const revenue = Math.floor((args.acceptedKgMilli * args.sellingRateCentsPerKg + 500) / 1000);
+  for (const [label, value] of Object.entries(args)) {
+    if (!Number.isSafeInteger(value)) throw new Error(`${label} must be a safe integer`);
+  }
+  if (args.purchaseCostCents < 0 || args.acceptedKgMilli < 0 || args.sellingRateCentsPerKg < 0 || args.expenseCents < 0) throw new Error('Dispatch amounts cannot be negative');
+  const revenue = Number((BigInt(args.acceptedKgMilli) * BigInt(args.sellingRateCentsPerKg) + 500n) / 1000n);
   const gross = revenue - args.purchaseCostCents;
   const net = gross - args.expenseCents + (args.adjustmentCents ?? 0);
   return { revenueCents: cents(revenue), grossProfitCents: cents(gross), netProfitCents: cents(net) };
@@ -21,9 +34,9 @@ export function calculateDispatchMetrics(args: {
   if (args.acceptedKgMilli < 0 || args.purchaseCostCents < 0 || args.sellingRateCentsPerKg < 0 || args.directExpenseCents < 0) throw new Error('Dispatch values cannot be negative');
   const profit = calculateDispatchProfit({ purchaseCostCents: args.purchaseCostCents, acceptedKgMilli: args.acceptedKgMilli, sellingRateCentsPerKg: args.sellingRateCentsPerKg, expenseCents: args.directExpenseCents, adjustmentCents: args.adjustmentCents ?? 0 });
   const quantityVarianceMilli = args.acceptedKgMilli - args.acquiredKgMilli;
-  const quantityVarianceBasisPoints = Math.round(quantityVarianceMilli * 10_000 / args.acquiredKgMilli);
-  const profitMarginBasisPoints = profit.revenueCents === 0 ? 0 : Math.round(profit.netProfitCents * 10_000 / profit.revenueCents);
-  const costPerAcquiredKgCents = Math.round(args.purchaseCostCents * 1000 / args.acquiredKgMilli);
+  const quantityVarianceBasisPoints = roundedRatio(quantityVarianceMilli, 10_000, args.acquiredKgMilli);
+  const profitMarginBasisPoints = profit.revenueCents === 0 ? 0 : roundedRatio(profit.netProfitCents, 10_000, profit.revenueCents);
+  const costPerAcquiredKgCents = roundedRatio(args.purchaseCostCents, 1000, args.acquiredKgMilli);
   return { ...profit, quantityVarianceMilli, quantityVarianceBasisPoints, profitMarginBasisPoints, costPerAcquiredKgCents };
 }
 

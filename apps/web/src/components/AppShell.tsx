@@ -8,7 +8,7 @@ const links = [
   ['Dashboard', '/', LayoutDashboard], ['Latex POS', '/pos', Gauge], ['Purchase History', '/purchases', ReceiptText], ['Suppliers', '/suppliers', Users],
   ['Supplier Ledger', '/supplier-ledger', ClipboardList], ['Advances & Loans', '/advances', HandCoins], ['Payments', '/payments', WalletCards], ['Daily Rates', '/rates', Activity],
   ['Inventory', '/inventory', PackageOpen], ['Bowser Dispatches', '/dispatches', Truck], ['Company Sales', '/sales', Banknote], ['Buyers / Companies', '/buyers', Building2],
-  ['Expenses', '/expenses', ReceiptText], ['Cash & Bank', '/cash-bank', WalletCards], ['Reports & Analytics', '/reports', BarChart3], ['Audit Log', '/audit', ShieldCheck], ['Settings', '/settings', Settings],
+  ['Expenses', '/expenses', ReceiptText], ['Cash & Bank', '/cash-bank', WalletCards], ['Approvals', '/approvals', ShieldCheck], ['Reports & Analytics', '/reports', BarChart3], ['Audit Log', '/audit', ShieldCheck], ['Settings', '/settings', Settings],
 ] as const;
 
 export function AppShell({ user, children }: { user: SessionUser; children: ReactNode }) {

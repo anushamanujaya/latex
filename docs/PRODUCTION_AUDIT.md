@@ -1,6 +1,22 @@
 # Production readiness audit
 
+> **Final closure update (2026-11-04): real-customer production NOT ACCEPTED.** The isolated browser suite now has **20/20 independent scenarios passed**, and the Phase A **6/6**, Phase B **25/25**, repository **16/16**, TypeScript, and production build checks passed again. This supersedes the older 12-flow count below. The eight new flows include advance-funded purchase, safe company receipt reversal, direct-expense/profit-adjustment reversals, cashier closeout, stale approval, a blocked cross-supplier cash correction, and mobile receipt reprint. No physical printer or real staging environment was tested; finance-owned cross-ledger rules remain unresolved. See [final release report](FINAL_RELEASE_REPORT.md).
+
+> **Prior 12-flow snapshot (2026-11-04; superseded above):** Maker/checker approval covers eight financial reversal kinds plus correction, reconciliation, profit adjustment, refund, and overdraft changes. An approved same-supplier/same-account cash-paid replacement posts only its cash difference; an approved dispatched cost/quantity delta preserves posted settlement and boundary. New corrections reject conflicting idempotency-key reuse. Local Phase A **6/6**, Phase B **25/25**, repository **16/16**, TypeScript, production build, and browser **12/12** passed on isolated synthetic data at that point. The original 20-item table was checkpoints. The software receipt PDF is 80 mm wide with a legible self-hosted Sinhala font. Physical printer, actual Atlas/Vercel staging, wider cross-ledger accounting policy, browser variants, and later-phase security/reporting remain open. See the [final release report](FINAL_RELEASE_REPORT.md). All older dated findings below are historical snapshots, not current feature inventory.
+
+> Historical Phase B snapshot (2026-11-03): retained below for traceability. Its test counts and blocker list have been superseded by the 2026-11-04 acceptance report linked above.
+
+> Phase B update (2026-11-03): dispatch drafts/locking, weighbridge reconciliation, expense/transfer posting, and controlled purchase correction have been implemented since this audit. The numbered findings below are the original 2026-11-02 snapshot and are not a current feature inventory. See [Phase B status](PHASE_B_DISPATCH_RECONCILIATION.md) for implementation, verification limits, and remaining deployment blockers. Production readiness remains **not established**.
+
 Audit date: 2026-11-02. Scope: the complete repository, including workspace/package configuration, API, UI, domain arithmetic, local MongoDB replica set, tests, and deployment documentation.
+
+## Current Phase B re-audit (2026-11-03)
+
+The original Phase B findings 1-4 below are now **partly resolved**: controlled purchase correction/replacement, weighbridge reconciliation, batch profit, expense posting/payment/reversal, internal transfers, and invoice debit/credit histories are implemented. Expense, correction, and reconciliation operator screens are functional. The original numbered findings remain below as historical context, not a claim that those functions are absent today. See [Phase B implementation and acceptance status](PHASE_B_DISPATCH_RECONCILIATION.md).
+
+Local replica-set evidence: 6/6 Phase A regression tests and 19/19 Phase B transaction/integration tests passed on 2026-11-03 in isolated databases. The Phase B suite includes a service-layer purchase-to-settlement profit path, a competing-transfer race, credits below receipts with partial/final refunds, and an approved bounded bank overdraft. Production build passed. Route splitting reduced the initial web JavaScript chunk from 761.36 kB to 310.62 kB; dashboard code loads as a separate 366.00 kB chunk. Synthetic test data was retained; no database was reset. See [final acceptance report](PHASE_B_ACCEPTANCE_REPORT.md) for the current test matrix and limitations.
+
+**Still blocking financial customer deployment:** the complete UI/browser and receipt-print acceptance matrix; corrections that change already-settled cash or dispatched supplier/settlement details; two-person approval outside the new refund and overdraft paths; UI for refund/approval operations; and decisions on tax, backdating, weighbridge evidence, and invoiced-batch cost changes. Cheque lifecycle, formal chart of accounts, returns/inventory adjustments, reports/exports, security hardening, and production environment smoke tests also remain. Phase B is not accepted, and the application is not production-ready.
 
 ## Resolved deployment blockers
 
