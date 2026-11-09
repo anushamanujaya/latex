@@ -30,15 +30,20 @@ export function approvalPayloadHash(payload: Record<string, unknown>) {
   return createHash('sha256').update(JSON.stringify(canonical(payload))).digest('hex');
 }
 
+function matchingApprovalRequest(existing:any,input:{operation:ApprovalOperation;targetId:string;requestReason:string},payloadHash:string,actor:AuthUser){
+  if(existing.operation!==input.operation||String(existing.targetId)!==input.targetId||existing.payloadHash!==payloadHash||existing.requestReason!==input.requestReason||String(existing.requestedBy)!==actor.id)throw new AppError(409,'IDEMPOTENCY_KEY_CONFLICT','Approval key was used for another request');
+  return existing;
+}
+
 export async function requestApproval(input:{idempotencyKey:string;operation:ApprovalOperation;targetId:string;payload:Record<string,unknown>;requestReason:string},actor:AuthUser){
   requireFinancialRole(actor, ['ADMIN', 'MANAGER', 'ACCOUNTANT']);
   const existing=await ApprovalRequest.findOne({idempotencyKey:input.idempotencyKey});
   const payloadHash=approvalPayloadHash(input.payload);
-  if(existing){if(existing.operation!==input.operation||String(existing.targetId)!==input.targetId||existing.payloadHash!==payloadHash)throw new AppError(409,'IDEMPOTENCY_KEY_CONFLICT','Approval key was used for another operation');return existing;}
+  if(existing)return matchingApprovalRequest(existing,input,payloadHash,actor);
   const session=await mongoose.startSession();try{let request:any;await session.withTransaction(async()=>{
     [request]=await ApprovalRequest.create([{...input,payloadHash,requestedBy:actor.id}],{session});
     await AuditLog.create([{actorId:actor.id,action:'APPROVAL_REQUESTED',entityType:'ApprovalRequest',entityId:request._id,reason:input.requestReason,after:{operation:input.operation,targetId:input.targetId,payloadHash}}],{session});
-  });return request;}finally{await session.endSession();}
+  });return request;}catch(error){if((error as {code?:number}).code===11000){const duplicate=await ApprovalRequest.findOne({idempotencyKey:input.idempotencyKey});if(duplicate)return matchingApprovalRequest(duplicate,input,payloadHash,actor);}throw error;}finally{await session.endSession();}
 }
 
 export async function decideApproval(approvalId:string,input:{approve:boolean;reason:string},actor:AuthUser){

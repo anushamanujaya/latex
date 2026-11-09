@@ -18,20 +18,9 @@ mongodb+srv://<app-user>:<encoded-password>@<cluster>/<database>?retryWrites=tru
 
 Never put this value in Git, `.env.example`, frontend variables, screenshots, tickets, or customer documents.
 
-## 2. Push to a private GitHub repository
+## 2. Use the existing GitHub repository safely
 
-From the repository root, after reviewing `git status` and secrets:
-
-```powershell
-git init
-git add .
-git commit -m "Prepare latex suite for staging deployment"
-git branch -M main
-git remote add origin git@github.com:<organization>/<private-repository>.git
-git push -u origin main
-```
-
-Create the GitHub repository as **Private** before the push. Enable protected branches, required reviews, secret scanning, Dependabot/security alerts, and required CI checks. No push or repository creation is performed automatically by this project.
+The repository is already initialized on `main` with `origin` set to `https://github.com/anushamanujaya/latex.git`; do not run `git init`, replace its remote, or force-push. A read-only GitHub API check on 2026-11-09 reported this repository as **public**, not private. The owner must decide whether to make it private; review Git history for inadvertently committed secrets and rotate any exposed credentials before using it for a staging deployment. Do not assume `.gitignore` removes secrets already present in Git history. After owner authorization, review and commit the intended source changes on a **non-production staging branch**, then push that branch only if the linked Vercel projects are configured to deploy it as Preview. Pushing `main` can trigger Production deployments automatically. Enable protected branches, required reviews, secret scanning, Dependabot/security alerts, and required CI checks. No push or repository setting change is performed automatically by this project.
 
 ## 3. Create the backend Vercel project
 
@@ -40,14 +29,14 @@ Import the private repository as a new Vercel project.
 - Root Directory: `apps/api`
 - Include source files outside the Root Directory: enabled (required for `packages/domain` and the root lockfile)
 - Framework: allow Vercel to detect Express
-- Install Command: `npm install` (or leave the npm workspace default)
+- Install Command: `cd ../.. && npm ci --include=dev` (the workspace-lockfile command used in the prior Vercel build); verify the project setting rather than overriding a working installation
 - Build Command: `npm run vercel-build`
 - Output Directory: leave empty; Express is emitted as a Vercel Function
 - Node.js: `24.x` (also pinned in the root `package.json`)
 
 The supported entry point is the default Express export in `apps/api/src/app.ts`. `server.ts` is local-only.
 
-Set these Vercel variables separately for Preview and Production:
+For the staging demo, set these variables on **Preview only**, using a dedicated staging Atlas database and exact frontend Preview origin. Production settings are separate and must not point at staging data:
 
 ```text
 NODE_ENV=production
@@ -55,12 +44,12 @@ MONGODB_URI=<Atlas SRV secret>
 JWT_SECRET=<at least 32 cryptographically random characters>
 WEB_ORIGIN=https://staging-app.example.lk
 COOKIE_SECURE=true
-COOKIE_SAME_SITE=lax
+COOKIE_SAME_SITE=none
 MONGODB_MAX_POOL_SIZE=10
 MONGODB_SERVER_SELECTION_TIMEOUT_MS=10000
 ```
 
-`WEB_ORIGIN` accepts exact comma-separated origins when an environment has more than one trusted frontend. Do not use `*`. For unrelated frontend/API sites set `COOKIE_SAME_SITE=none`; sibling HTTPS subdomains can normally use `lax`.
+`WEB_ORIGIN` accepts exact comma-separated origins when an environment has more than one trusted frontend. Do not use `*`. Separate frontend/API `*.vercel.app` sites require `COOKIE_SAME_SITE=none` and real-browser cookie testing; third-party-cookie restrictions may still interfere. Sibling HTTPS custom domains can normally use `lax` and are preferred for reliable authentication.
 
 Deploy and verify:
 
@@ -76,7 +65,7 @@ Import the same repository as a second project.
 - Root Directory: `apps/web`
 - Include source files outside the Root Directory: enabled
 - Framework Preset: Vite
-- Install Command: `npm install` (or leave the npm workspace default)
+- Install Command: `cd ../.. && npm ci --include=dev` (verify the existing project setting)
 - Build Command: `npm run vercel-build`
 - Output Directory: `dist`
 - Node.js: `24.x`
@@ -89,7 +78,7 @@ VITE_API_URL=https://<backend-domain>/api/v1
 
 This is the only API location exposed to the browser. Never create a `VITE_` variable containing database credentials, JWT secrets, encryption keys, or administrator passwords.
 
-The checked-in `apps/web/vercel.json` provides React Router fallback. Test direct navigation to `/pos`, `/purchases/<id>/receipt`, and `/dispatches`, not only navigation from `/`.
+The checked-in `apps/web/vercel.json` provides React Router fallback **and contains hard-coded rewrites to `https://latex-demo-api.vercel.app`**. Before deploying a new frontend project, confirm that this is the intended staging backend; otherwise update the rewrites to the confirmed backend URL or remove them if all API calls use the absolute `VITE_API_URL`. Never assume the hard-coded hostname is the newly deployed backend. Test direct navigation to `/pos`, `/purchases/<id>/receipt`, and `/dispatches`, not only navigation from `/`.
 
 ## 5. Configure domains and cookies
 

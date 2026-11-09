@@ -739,6 +739,9 @@ class PhaseBBrowserSmoke(unittest.TestCase):
             page.get_by_text("Advance applied").locator("..").locator("input").fill("200")
             page.get_by_role("button", name="Save only").click()
             page.locator("#receipt").wait_for(timeout=20000)
+            receipt = page.locator("#receipt").inner_text().replace("\u00a0", " ")
+            for expected in ("PARTIALLY PAID", "Advance Applied:", "LKR 200.00", "Cash Paid:", "LKR 0.00", "BALANCE DUE:", "LKR 3,080.00"):
+                self.assertIn(expected, receipt)
             purchase_id = page.url.split("/purchases/")[1].split("/")[0]
             purchase = page.request.get(f"{BASE_URL}/api/v1/purchases/{purchase_id}").json()["data"]
             current_advance = next(a for a in page.request.get(f"{BASE_URL}/api/v1/advances").json()["data"] if a["_id"] == advance["_id"])

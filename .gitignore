@@ -10,3 +10,9 @@ coverage/
 playwright-report/
 test-results/
 .tmp/
+tmp/
+__pycache__/
+*.py[cod]
+.vercel/
+*.key
+*.pem

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { afterAll,beforeAll,describe,expect,it } from 'vitest';
 import { connectDatabase,disconnectDatabase } from './db.js';
 import type { AuthUser } from './http.js';
-import { BuyerCompany,BuyerLedgerEntry,CashBankAccount,CashBankTransaction,CashBankTransfer,CashierShift,CompanyInvoice,CompanyInvoiceAdjustment,CompanyRefund,DensityFactorVersion,DispatchBatch,DispatchFinancialAdjustment,Expense,Purchase,PurchaseCorrection,PurchaseRate,Supplier,SupplierLedgerEntry,SupplierPayment,User } from './models.js';
+import { ApprovalRequest,AuditLog,BuyerCompany,BuyerLedgerEntry,CashBankAccount,CashBankTransaction,CashBankTransfer,CashierShift,CompanyInvoice,CompanyInvoiceAdjustment,CompanyRefund,DensityFactorVersion,DispatchBatch,DispatchFinancialAdjustment,Expense,Purchase,PurchaseCorrection,PurchaseRate,Supplier,SupplierLedgerEntry,SupplierPayment,User } from './models.js';
 import { confirmDispatchDraft,createDispatchDraft,previewDispatch,reconcileDispatch as reconcileDispatchService,reconciliationApprovalPayload } from './services/dispatch-service.js';
 import { dispatchAdjustmentApprovalPayload,payExpense,postDispatchAdjustment as postDispatchAdjustmentService,postExpense,postTransfer,reverseDispatchAdjustment,reverseExpense,reverseTransfer } from './services/phase-b-financial-service.js';
 import { createCompanyInvoice,postCompanySettlement,postSupplierPayment } from './services/financial-service.js';
@@ -158,6 +158,17 @@ describe.runIf(enabled)('Phase B dispatch and correction transactions',()=>{
     const approval=await requestApproval({idempotencyKey:randomUUID(),operation:'BANK_OVERDRAFT',targetId:String(account._id),payload:overdraftApprovalPayload(String(account._id),100_000,'Concurrent approval decision'),requestReason:'Concurrent approval decision'},actor);
     const outcomes=await Promise.allSettled([decideApproval(String(approval._id),{approve:true,reason:'Independent first decision'},checker),decideApproval(String(approval._id),{approve:false,reason:'Independent competing decision'},checker)]);
     expect(outcomes.filter(x=>x.status==='fulfilled')).toHaveLength(1);
+  });
+  it('makes concurrent approval requests idempotent only for the original maker and exact reason',async()=>{
+    const account=await CashBankAccount.create({idempotencyKey:randomUUID(),code:`REQ-${marker}`,name:'Approval request test bank',type:'BANK',openingBalanceCents:0,active:true,createdBy:actor.id});
+    const key=randomUUID();
+    const input={idempotencyKey:key,operation:'BANK_OVERDRAFT' as const,targetId:String(account._id),payload:overdraftApprovalPayload(String(account._id),100_000,'Concurrent request'),requestReason:'Concurrent request'};
+    const [first,second]=await Promise.all([requestApproval(input,actor),requestApproval(input,actor)]);
+    expect(String(first._id)).toBe(String(second._id));
+    expect(await ApprovalRequest.countDocuments({idempotencyKey:key})).toBe(1);
+    expect(await AuditLog.countDocuments({action:'APPROVAL_REQUESTED',entityId:first._id})).toBe(1);
+    await expect(requestApproval(input,checker)).rejects.toMatchObject({code:'IDEMPOTENCY_KEY_CONFLICT'});
+    await expect(requestApproval({...input,requestReason:'Changed request reason'},actor)).rejects.toMatchObject({code:'IDEMPOTENCY_KEY_CONFLICT'});
   });
   it('allows at most one competing transfer to spend the same source balance',async()=>{
     const source=await CashBankAccount.create({idempotencyKey:randomUUID(),code:`RACE-S-${marker}`,name:'Race source',type:'BANK',openingBalanceCents:0,active:true,createdBy:actor.id});
