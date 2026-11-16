@@ -9,7 +9,7 @@ const demoPassword = process.env.DEV_SEED_PASSWORD;
 if (!demoPassword || demoPassword.length < 12) throw new Error('Set DEV_SEED_PASSWORD to a unique password of at least 12 characters before running the development seed');
 await connectDatabase();
 const passwordHash = await argon2.hash(demoPassword);
-const admin = await User.findOneAndUpdate({ email: 'admin@latex.local' }, { $setOnInsert: { name: 'Nimal Perera', email: 'admin@latex.local', passwordHash, role: 'ADMIN', active: true } }, { upsert: true, returnDocument: 'after' });
+const admin = await User.findOneAndUpdate({ email: 'admin@latex.local' }, { $setOnInsert: { name: 'Suneth Kaushalya', email: 'admin@latex.local', passwordHash, role: 'ADMIN', active: true } }, { upsert: true, returnDocument: 'after' });
 await User.findOneAndUpdate({ email: 'cashier@latex.local' }, { $setOnInsert: { name: 'Kaushalya Silva', email: 'cashier@latex.local', passwordHash, role: 'CASHIER', active: true } }, { upsert: true });
 for (const supplier of [
   { code: 'SUP-001', name: 'Sunil Jayasinghe', mobile: '0771234567', village: 'Agalawatta' },
