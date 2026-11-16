@@ -21,6 +21,11 @@ const Expenses = lazy(() => import('./pages/Expenses').then(m => ({ default: m.E
 const PurchaseCorrection = lazy(() => import('./pages/PurchaseCorrection').then(m => ({ default: m.PurchaseCorrection })));
 const Approvals = lazy(() => import('./pages/Approvals').then(m => ({ default: m.Approvals })));
 const FinancialAudit = lazy(() => import('./pages/FinancialAudit').then(m => ({ default: m.FinancialAudit })));
+const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.Settings })));
+const Inventory = lazy(() => import('./pages/Inventory').then(m => ({ default: m.Inventory })));
+const SupplierLedger = lazy(() => import('./pages/SupplierLedger').then(m => ({ default: m.SupplierLedger })));
+const Buyers = lazy(() => import('./pages/Buyers').then(m => ({ default: m.Buyers })));
+const Reports = lazy(() => import('./pages/Reports').then(m => ({ default: m.Reports })));
 
 export type SessionUser = { id: string; name: string; role: string };
 export default function App() {
@@ -45,6 +50,11 @@ export default function App() {
     <Route path="/approvals" element={<Approvals />} />
     <Route path="/approvals/:id" element={<Approvals />} />
     <Route path="/audit" element={<FinancialAudit />} />
+    <Route path="/settings" element={<Settings />} />
+    <Route path="/inventory" element={<Inventory />} />
+    <Route path="/supplier-ledger" element={<SupplierLedger />} />
+    <Route path="/buyers" element={<Buyers />} />
+    <Route path="/reports" element={<Reports />} />
     <Route path="/:section" element={<Placeholder />} />
     <Route path="*" element={<Navigate to="/" replace />} />
   </Routes></Suspense></AppShell>;

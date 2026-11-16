@@ -244,8 +244,11 @@ router.get('/cashier-shifts', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR')
 }));
 
 router.get('/inventory', asyncRoute(async (_req, res) => {
-  const [pending] = await Purchase.aggregate([{ $match: { dispatchStatus: 'PENDING', reversedAt: { $exists: false } } }, { $group: { _id: null, litresMilli: { $sum: '$litresMilli' }, kgMilli: { $sum: '$kgMilli' }, purchaseCostCents: { $sum: '$totalCents' }, purchaseCount: { $sum: 1 } } }]);
-  res.json({ data: pending ?? { litresMilli: 0, kgMilli: 0, purchaseCostCents: 0, purchaseCount: 0 } });
+  const [pending, purchases] = await Promise.all([
+    Purchase.aggregate([{ $match: { dispatchStatus: 'PENDING', reversedAt: { $exists: false } } }, { $group: { _id: null, litresMilli: { $sum: '$litresMilli' }, kgMilli: { $sum: '$kgMilli' }, purchaseCostCents: { $sum: '$totalCents' }, purchaseCount: { $sum: 1 } } }]),
+    Purchase.find({ dispatchStatus: 'PENDING', reversedAt: { $exists: false } }).sort({ sequence: 1 }).limit(500).populate('supplierId', 'code name').lean(),
+  ]);
+  res.json({ data: pending[0] ?? { litresMilli: 0, kgMilli: 0, purchaseCostCents: 0, purchaseCount: 0 }, purchases });
 }));
 router.get('/dispatches/preview', allow('ADMIN', 'MANAGER'), asyncRoute(async (req, res) => res.json({ data: await previewDispatch(String(req.query.locationId ?? 'MAIN'), Number(req.query.lastSequence)) })));
 router.post('/dispatches/drafts', allow('ADMIN', 'MANAGER'), asyncRoute(async (req, res) => {
@@ -286,6 +289,12 @@ router.post('/cash-transfers',allow('ADMIN','ACCOUNTANT'),asyncRoute(async(req,r
 router.get('/cash-transfers',allow('ADMIN','MANAGER','ACCOUNTANT','AUDITOR'),asyncRoute(async(_req,res)=>res.json({data:await CashBankTransfer.find().sort({eventAt:-1}).populate('sourceAccountId','code name type').populate('destinationAccountId','code name type').lean()})));
 router.post('/cash-transfers/:id/reverse',allow('ADMIN','ACCOUNTANT'),asyncRoute(async(req,res)=>{const input=z.object({idempotencyKey:z.string().uuid(),eventAt:z.coerce.date(),reason:z.string().min(5).max(500),approvalId:z.string().min(1)}).parse(req.body);res.json({data:await reverseTransfer(req.params.id,input,req.user!)});}));
 router.get('/buyers', asyncRoute(async (_req, res) => res.json({ data: await BuyerCompany.find({ active: true }).sort({ name: 1 }).lean() })));
+router.post('/buyers', allow('ADMIN', 'MANAGER'), asyncRoute(async (req, res) => {
+  const input = z.object({ name: z.string().trim().min(2).max(120), contact: z.string().trim().max(100).optional(), address: z.string().trim().max(300).optional(), settlementTerms: z.string().trim().max(200).optional() }).parse(req.body);
+  const buyer = await BuyerCompany.create(input);
+  await AuditLog.create({ actorId: req.user.id, action: 'BUYER_CREATED', entityType: 'BuyerCompany', entityId: buyer._id, after: input, ip: req.ip });
+  res.status(201).json({ data: buyer });
+}));
 router.get('/buyers/:id/statement', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
   const entries = await BuyerLedgerEntry.find({ buyerId: req.params.id }).sort({ eventAt: 1, _id: 1 }).lean();
   let receivableCents = 0;
@@ -372,6 +381,30 @@ router.get('/dashboard', asyncRoute(async (_req, res) => {
   const [liability] = await Purchase.aggregate([{ $match: { reversedAt: { $exists: false } } }, { $group: { _id: null, cents: { $sum: '$outstandingCents' } } }]);
   const lastDispatch = await DispatchBatch.findOne({ status: { $in: ['CONFIRMED', 'FINALIZED'] } }).sort({ dispatchedAt: -1 }).lean();
   res.json({ data: { today: today ?? { litresMilli: 0, kgMilli: 0, procurementCents: 0, cashPaidCents: 0 }, inventory: inventory ?? { kgMilli: 0, costCents: 0 }, supplierLiabilityCents: liability?.cents ?? 0, lastDispatch } });
+}));
+
+router.get('/reports/summary', allow('ADMIN', 'MANAGER', 'ACCOUNTANT', 'AUDITOR'), asyncRoute(async (req, res) => {
+  const now = new Date();
+  const from = req.query.from ? z.coerce.date().parse(req.query.from) : new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  const to = req.query.to ? z.coerce.date().parse(req.query.to) : now;
+  if (from > to) throw new AppError(422, 'INVALID_REPORT_RANGE', 'Report start date must be before the end date');
+  const period = { $gte: from, $lte: to };
+  const [purchaseRows, dispatchRows, expenseRows, invoiceRows, supplierLiability, buyerReceivable] = await Promise.all([
+    Purchase.aggregate([{ $match: { eventAt: period, reversedAt: { $exists: false } } }, { $group: { _id: null, count: { $sum: 1 }, litresMilli: { $sum: '$litresMilli' }, kgMilli: { $sum: '$kgMilli' }, procurementCents: { $sum: '$totalCents' }, cashPaidCents: { $sum: '$cashPaidCents' }, outstandingCents: { $sum: '$outstandingCents' } } }]),
+    DispatchBatch.aggregate([{ $match: { dispatchedAt: period, status: { $ne: 'DRAFT' } } }, { $group: { _id: null, count: { $sum: 1 }, acquiredKgMilli: { $sum: '$acquiredKgMilli' }, acceptedKgMilli: { $sum: { $ifNull: ['$acceptedKgMilli', 0] } }, revenueCents: { $sum: { $ifNull: ['$revenueCents', 0] } }, netProfitCents: { $sum: { $ifNull: ['$netProfitCents', 0] } } } }]),
+    Expense.aggregate([{ $match: { expenseAt: period, status: { $ne: 'REVERSED' } } }, { $group: { _id: null, count: { $sum: 1 }, amountCents: { $sum: '$amountCents' } } }]),
+    CompanyInvoice.aggregate([{ $match: { issuedAt: period } }, { $group: { _id: null, count: { $sum: 1 }, invoicedCents: { $sum: '$totalCents' }, outstandingCents: { $sum: '$outstandingCents' }, refundDueCents: { $sum: '$refundDueCents' } } }]),
+    SupplierLedgerEntry.aggregate([{ $group: { _id: null, payableCents: { $sum: '$payableDeltaCents' }, advanceCents: { $sum: '$advanceDeltaCents' } } }]),
+    BuyerLedgerEntry.aggregate([{ $group: { _id: null, receivableCents: { $sum: '$receivableDeltaCents' } } }]),
+  ]);
+  res.json({ data: {
+    range: { from, to },
+    purchases: purchaseRows[0] ?? { count: 0, litresMilli: 0, kgMilli: 0, procurementCents: 0, cashPaidCents: 0, outstandingCents: 0 },
+    dispatches: dispatchRows[0] ?? { count: 0, acquiredKgMilli: 0, acceptedKgMilli: 0, revenueCents: 0, netProfitCents: 0 },
+    expenses: expenseRows[0] ?? { count: 0, amountCents: 0 },
+    invoices: invoiceRows[0] ?? { count: 0, invoicedCents: 0, outstandingCents: 0, refundDueCents: 0 },
+    positions: { supplierPayableCents: supplierLiability[0]?.payableCents ?? 0, supplierAdvanceCents: supplierLiability[0]?.advanceCents ?? 0, buyerReceivableCents: buyerReceivable[0]?.receivableCents ?? 0 },
+  } });
 }));
 
 export default router;
